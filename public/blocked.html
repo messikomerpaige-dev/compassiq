@@ -1,0 +1,28 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Access turned off · CompassIQ</title>
+<link rel="stylesheet" href="/assets/ciq.css">
+</head>
+<body>
+<main class="center">
+  <div class="card">
+    <div class="brand">
+      <svg width="26" height="26" viewBox="0 0 56 56" fill="none" aria-hidden="true"><circle cx="28" cy="28" r="22" stroke="currentColor" stroke-width="2.6"/><path d="M28 10 L34 28 L28 25 L22 28 Z" fill="#7c5cff"/><path d="M28 46 L34 28 L28 31 L22 28 Z" fill="currentColor" opacity=".35"/></svg>
+      <span>Compass<em>IQ</em></span>
+    </div>
+    <h1>Your access is turned off</h1>
+    <p class="muted">Your CompassIQ access has been turned off, or you haven’t been added to a company yet. CompassIQ data on this device has been erased.</p>
+    <p class="muted">If you think this is a mistake, contact your company’s CompassIQ admin.</p>
+    <button class="btn block secondary" id="out" type="button">Sign out</button>
+  </div>
+</main>
+<script src="/assets/ciq-page.js"></script>
+<script>
+  window.CIQ.wipeLocal();
+  document.getElementById('out').addEventListener('click', window.CIQ.signOut);
+</script>
+</body>
+</html>

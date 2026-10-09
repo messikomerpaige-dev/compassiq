@@ -1,0 +1,110 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Companies · CompassIQ</title>
+<link rel="stylesheet" href="/assets/ciq.css">
+</head>
+<body>
+<header class="topbar">
+  <div class="brand">
+    <svg width="24" height="24" viewBox="0 0 56 56" fill="none" aria-hidden="true"><circle cx="28" cy="28" r="22" stroke="currentColor" stroke-width="2.6"/><path d="M28 10 L34 28 L28 25 L22 28 Z" fill="#7c5cff"/><path d="M28 46 L34 28 L28 31 L22 28 Z" fill="currentColor" opacity=".35"/></svg>
+    <span>Compass<em>IQ</em></span>
+    <span class="muted" style="font-weight:400;font-size:14px;">· CompassIQ team</span>
+  </div>
+  <div class="who"><span id="me"></span><button class="btn secondary sm" id="signout" type="button">Sign out</button></div>
+</header>
+
+<main class="wrap">
+  <div class="msg" id="page-msg" role="alert"></div>
+
+  <section class="panel">
+    <div class="panel-head"><h2>Client companies</h2><button class="btn sm" id="new-open" type="button">Add a company</button></div>
+    <div class="table-wrap"><table>
+      <thead><tr><th>Company</th><th>Owner</th><th>People</th><th>Territories</th><th>Doctors</th><th>Status</th><th></th></tr></thead>
+      <tbody id="orgs"></tbody>
+    </table></div>
+  </section>
+</main>
+
+<dialog id="new-dlg">
+  <form id="new-form" novalidate>
+    <h2>Add a company</h2>
+    <p class="muted small">The owner gets an email to set their password, then invites their own team.</p>
+    <label for="n-name">Company name</label>
+    <input type="text" id="n-name" autocomplete="off">
+    <label for="n-owner">Owner’s email</label>
+    <input type="email" id="n-owner" autocomplete="off">
+    <label for="n-owner-name">Owner’s name</label>
+    <input type="text" id="n-owner-name" autocomplete="off">
+    <div class="msg" id="new-msg" role="alert"></div>
+    <div class="dialog-actions">
+      <button class="btn secondary" type="button" id="new-cancel">Cancel</button>
+      <button class="btn" id="new-save" type="submit">Create and invite owner</button>
+    </div>
+  </form>
+</dialog>
+
+<script src="/assets/ciq-page.js"></script>
+<script>
+(function () {
+  'use strict';
+  const { api, h, showMsg, signOut } = window.CIQ;
+  const $ = (id) => document.getElementById(id);
+  $('signout').addEventListener('click', signOut);
+
+  async function load() {
+    try {
+      const me = await api('/api/session');
+      if (!me.access.platform_admin) return location.replace(me.home || '/');
+      $('me').textContent = me.email;
+      render(await api('/api/platform'));
+    } catch (e) {
+      if (e.status === 401) return location.replace('/?next=/platform');
+      showMsg($('page-msg'), e.message);
+    }
+  }
+
+  function render(orgs) {
+    $('orgs').replaceChildren(...(orgs.length ? orgs.map((o) => h('tr', {},
+      h('td', {}, o.name),
+      h('td', { class: 'small' }, o.owners.join(', ') || '—'),
+      h('td', { class: 'num' }, o.active_members + ' active' + (o.members > o.active_members ? ' · ' + (o.members - o.active_members) + ' off' : '')),
+      h('td', { class: 'num' }, String(o.territories)),
+      h('td', { class: 'num' }, o.hcps.toLocaleString()),
+      h('td', {}, h('span', { class: 'pill ' + (o.status === 'active' ? 'ok' : 'off') }, o.status === 'active' ? 'Active' : 'Suspended')),
+      h('td', {}, o.status === 'active'
+        ? h('button', { class: 'btn danger sm', type: 'button', onclick: () => setStatus(o, 'suspended') }, 'Suspend')
+        : h('button', { class: 'btn secondary sm', type: 'button', onclick: () => setStatus(o, 'active') }, 'Reactivate'))))
+      : [h('tr', {}, h('td', { colspan: 7, class: 'empty' }, 'No client companies yet.'))]));
+  }
+
+  async function setStatus(o, status) {
+    if (status === 'suspended' && !confirm('Suspend ' + o.name + '? Everyone at ' + o.name + ' loses access right away, and CompassIQ data on their devices is erased. Their company data is kept.')) return;
+    try {
+      const r = await api('/api/platform', { method: 'POST', body: { action: 'status', org_id: o.id, status } });
+      showMsg($('page-msg'), o.name + (status === 'suspended' ? ' is suspended — ' + r.people + ' people lost access.' : ' is active again — ' + r.people + ' people have access.'), 'ok');
+      render(await api('/api/platform'));
+    } catch (err) { showMsg($('page-msg'), err.message); }
+  }
+
+  $('new-open').addEventListener('click', () => { showMsg($('new-msg'), ''); $('new-form').reset(); $('new-dlg').showModal(); $('n-name').focus(); });
+  $('new-cancel').addEventListener('click', () => $('new-dlg').close());
+  $('new-form').addEventListener('submit', async (e) => {
+    e.preventDefault();
+    $('new-save').disabled = true;
+    try {
+      const r = await api('/api/platform', { method: 'POST', body: { action: 'create', name: $('n-name').value, owner_email: $('n-owner').value, owner_name: $('n-owner-name').value } });
+      $('new-dlg').close();
+      showMsg($('page-msg'), 'Company created. ' + (r.existing ? 'The owner already had a login and can sign in now.' : 'Invite sent to the owner.'), 'ok');
+      render(await api('/api/platform'));
+    } catch (err) { showMsg($('new-msg'), err.message); }
+    finally { $('new-save').disabled = false; }
+  });
+
+  load();
+})();
+</script>
+</body>
+</html>
