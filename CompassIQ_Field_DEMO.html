@@ -4011,7 +4011,7 @@ let STATE = defaultTerritoryData();
 
 // Increment this whenever the routing algorithm changes significantly.
 // Plans generated with an older version will show a "regenerate" warning.
-const ROUTING_VERSION = 30; // v30: call activity — remaining-to-goal planning, unreached first. v29: coverage-fill geo-weighted sort per day + resequence covers coverage-fill days
+const ROUTING_VERSION = 31; // v31: quarter improvement pass (moves/swaps for drive time + visit spacing). v30: call activity — remaining-to-goal planning, unreached first. v29: coverage-fill geo-weighted sort per day + resequence covers coverage-fill days
 
 // ═══════════════════════════════════════════════════════════════════
 // PERSISTENCE
@@ -10406,18 +10406,15 @@ function generateQuarter() {
   // This pass re-optimizes every day that received mop-up stops using
   // all-starts NN + 2-opt on the full day. Co-located stops (same _officeKey)
   // are grouped into blocks so they stay adjacent through the optimization.
-  (() => {
+  // v4.6: reusable — also re-sequences days touched by the quarter improvement pass
+  const _ciqReseqDays = (mopupDates, minStops, fixedOrder) => {
     const homeZipMU = C.homeAddress ? C.homeAddress.match(/\b(\d{5})\b/) : null;
     const homeCoordMU = homeZipMU ? (ZIP_COORDS[homeZipMU[1]] || null) : null;
-
-    const mopupDates = [...new Set(
-      allVisits.filter(v => (v.notes||'').includes('mop-up') || (v.notes||'').includes('coverage-fill')).map(v => v.date)
-    )];
 
     for (const date of mopupDates) {
       if (isDayLocked(date)) continue;
       const dayVs = allVisits.filter(v => v.date === date);
-      if (dayVs.length <= 1) continue;
+      if (dayVs.length < minStops) continue;
 
       const morningHotel = getHotelForMorning(date);
       const hotelCoord = morningHotel ? (ZIP_COORDS[morningHotel.zip5] || null) : null;
@@ -10500,7 +10497,9 @@ function generateQuarter() {
       };
 
       let reordered;
-      if (mealBlockInfos.length > 0) {
+      if (fixedOrder && fixedOrder[date] && fixedOrder[date].length === dayVs.length) {
+        reordered = fixedOrder[date];                              // order already optimised by the caller
+      } else if (mealBlockInfos.length > 0) {
         const mealIdxSet = new Set(mealBlockInfos.map(m => m.idx));
         const parts = [];
         let segBlocks = [];
@@ -10550,8 +10549,14 @@ function generateQuarter() {
         v.callNum = i + 1;
       });
     }
+  };
+  {
+    const mopupDates = [...new Set(
+      allVisits.filter(v => (v.notes||'').includes('mop-up') || (v.notes||'').includes('coverage-fill')).map(v => v.date)
+    )];
+    _ciqReseqDays(mopupDates, 2);
     if (mopupDates.length > 0) addLog(`[RESEQ] Post-mop-up resequence (NN+2-opt${_ciqRoadOn() ? ', road drive times' : ''}) applied to ${mopupDates.length} day(s)`);
-  })();
+  }
   // ── END POST-MOP-UP RESEQUENCE ─────────────────────────────────────────────
 
   // ── GEO-COHESION PASS ─────────────────────────────────────────────────────
@@ -10744,6 +10749,279 @@ function generateQuarter() {
     if (totalMoved > 0) addLog(`[GEO-COHESION] Pass complete — ${totalMoved} call(s) rebalanced to better-fitting days`);
   })();
   // ── END GEO-COHESION PASS ─────────────────────────────────────────────────
+  const _improvedDates = new Set(), _improvedOrder = {};
+
+  // ── QUARTER IMPROVEMENT PASS (v4.6) ───────────────────────────────────────
+  // Local search over the finished plan (bounded to TIME_BUDGET_MS): move a visit to another day, or swap
+  // two visits between days, whenever that lowers
+  //   total drive minutes (home → stops → home, every day — road minutes when a
+  //   drive matrix is cached, else the straight-line estimate)
+  //   + SPACING_WEIGHT min for every week a doctor's visits fall short of their
+  //     spacing (visits ≥ ~60% of the even gap apart: plan weeks ÷ visits).
+  // Leaves alone: locked, half-day, hotel/sweep and overnight-distance days;
+  // meals (and won't add to meal days); by-appointment doctors; doctors with an
+  // alternate address, late opening, early closing or preferred window on the
+  // day; group-practice visits seen together. Never moves a doctor's first
+  // visit later (keeps new / trend / not-yet-reached doctors early). Respects
+  // the daily call target, availability, once-a-week per doctor and per office,
+  // and the workday length. Touched days are re-sequenced and re-timed.
+  (function quarterImprovePass() {
+    const SPACING_WEIGHT = C.spacingWeight != null ? C.spacingWeight : 15, MAX_PASSES = 8, TIME_BUDGET_MS = 2500;
+    const t0 = Date.now();
+    const homeZ = ((C.homeAddress || '').match(/\b(\d{5})\b/) || [])[1] || null;
+    if (!homeZ || !ZIP_COORDS[homeZ]) { addLog('[IMPROVE] Skipped — add a home address in Config to enable the quarter improvement pass'); return; }
+    const road = _ciqRoadOn();
+    const zipOfV = new Map();
+    const zOf = v => { let z = zipOfV.get(v); if (z === undefined) { z = String(v.zip5 || '').replace(/\D/g, '').padStart(5, '0').slice(0, 5); zipOfV.set(v, z); } return z; };
+    const HOME = { _home: true };
+    // legMin: minutes used to choose routes (road minutes when cached, else the estimate);
+    // legTime: the padded minutes the day timeline will schedule (used to check a day fits)
+    const legCache = new Map(), timeCache = new Map();
+    const sameOffice = (a, b) => !a._home && !b._home && a.hcpRef && b.hcpRef && a.hcpRef._officeKey && a.hcpRef._officeKey === b.hcpRef._officeKey;
+    const legMin = (a, b) => {
+      if (sameOffice(a, b)) return 0;
+      const za = a._home ? homeZ : zOf(a), zb = b._home ? homeZ : zOf(b), key = za + zb;
+      let t = legCache.get(key);
+      if (t === undefined) {
+        const ca = ZIP_COORDS[za], cb = ZIP_COORDS[zb];
+        if (road) t = _ciqLegMin(za, ca, zb, cb);
+        else t = (ca && cb) ? milesToMin(haversineMiles(ca[0], ca[1], cb[0], cb[1])) : (C.intraDefault || 20);
+        legCache.set(key, t);
+      }
+      return t;
+    };
+    const legTime = (a, b) => {                      // same rule as the re-sequence timeline
+      if (sameOffice(a, b)) return 0;
+      const za = a._home ? homeZ : zOf(a), zb = b._home ? homeZ : zOf(b), key = za + zb;
+      let t = timeCache.get(key);
+      if (t === undefined) {
+        const ca = ZIP_COORDS[za], cb = ZIP_COORDS[zb];
+        if (!ca || !cb) t = C.intraDefault || 20;
+        else { const est = milesToMin(haversineMiles(ca[0], ca[1], cb[0], cb[1])); t = road ? Math.max(est, realDriveMin(za, zb)) : est; }
+        timeCache.set(key, t);
+      }
+      return t;
+    };
+    const slot = (C.apptMin || 15) + (C.bufferMin || 5);
+    const wdByDate = {}, nextWd = {};
+    workDays.forEach((w, i) => { wdByDate[w.date] = w; nextWd[w.date] = workDays[i + 1] ? workDays[i + 1].date : null; });
+    const halfSet = new Set(STATE.tot_half || []);
+    const wdNameOf = d => ['sun','mon','tue','wed','thu','fri','sat'][new Date(d + 'T00:00:00').getDay()];
+    const dayStartMin = parseTime(C.workdayStart), dayEndMin = parseTime(C.workdayEnd);
+
+    // Day routes in current visit order
+    const days = {};
+    workDays.forEach(w => { days[w.date] = []; });
+    allVisits.forEach(v => { if (days[v.date]) days[v.date].push(v); });
+    Object.values(days).forEach(a => a.sort((x, y) => cmpTime(x.callStart, y.callStart)));
+    const frozen = {};
+    workDays.forEach(w => {
+      const d = w.date;
+      frozen[d] = isDayLocked(d) || halfSet.has(d + ':am') || halfSet.has(d + ':pm')
+        || !!getSweepOriginZip5(d) || !!sweepHotelByDate[d] || !!(nextWd[d] && getHotelForMorning(nextWd[d]))
+        || days[d].some(v => legTime(HOME, v) >= (C.overnightThresh || 120));
+    });
+    const hasMeal = d => days[d].some(v => v.isLunch);
+    const calls = d => days[d].filter(v => !v.isLunch).length;
+
+    // Doctor can be seen on that day at the normal location and hours
+    const plainOn = (h, d) => {
+      if (!h || h.byAppointmentOnly || h.repPrefWindow) return false;
+      const wd = wdNameOf(d);
+      if (h.officeHours && !h.daySchedule) return false;          // legacy hours: leave where the engine put it
+      const ds = (h.daySchedule || []).find(s => s.day === wd);
+      if (!ds) return true;
+      if (ds.available === false || ds.address) return false;
+      if (ds.preferred && (ds.prefStart || ds.prefEnd)) return false;
+      if (ds.open && parseTime(ds.open) > dayStartMin) return false;
+      if (ds.close && parseTime(ds.close) < dayEndMin) return false;
+      return true;
+    };
+
+    // Doctor → visits, office-week index, spacing targets
+    const byHcp = new Map(), officeWeek = {};
+    allVisits.forEach(v => {
+      if (!v.hcpRef || v.isLunch) return;
+      if (!byHcp.has(v.hcpRef)) byHcp.set(v.hcpRef, []);
+      byHcp.get(v.hcpRef).push(v);
+      const w = wdByDate[v.date];
+      if (w && v.hcpRef._officeKey) { const k = v.hcpRef._officeKey + '|' + w.calWeek; officeWeek[k] = (officeWeek[k] || 0) + 1; }
+    });
+    const minGap = new Map();
+    byHcp.forEach((vs, h) => { if (vs.length > 1) minGap.set(h, Math.max(1, Math.round(weeksN / vs.length * 0.6))); });
+    const spacingPen = (h, swapOut, newDate) => {
+      const g = minGap.get(h); if (!g) return 0;
+      const ws = byHcp.get(h).map(v => (v === swapOut ? newDate : v.date)).map(d => (wdByDate[d] ? wdByDate[d].week : 0)).sort((a, b) => a - b);
+      let p = 0;
+      for (let i = 1; i < ws.length; i++) p += Math.max(0, g - (ws[i] - ws[i - 1]));
+      return p;
+    };
+    const penNow = new Map();
+    const pen = h => { let x = penNow.get(h); if (x === undefined) { x = spacingPen(h); penNow.set(h, x); } return x; };
+    const isFirst = v => byHcp.get(v.hcpRef).every(o => o === v || o.date >= v.date);
+
+    const movable = v => !v.isLunch && !v.lunchTime && v.hcpRef && byHcp.has(v.hcpRef) && frozen[v.date] === false
+      && plainOn(v.hcpRef, v.date)
+      && !days[v.date].some(o => o !== v && o.hcpRef && o.hcpRef._officeKey === v.hcpRef._officeKey);   // keep group practices together
+    // Can visit v go to day d? (`leaving` = the visit it swaps with, which leaves d)
+    const canPlace = (v, d, leaving) => {
+      if (d === v.date || frozen[d] !== false || hasMeal(d)) return false;
+      const h = v.hcpRef;
+      if (!plainOn(h, d)) return false;
+      if (d > v.date && isFirst(v)) return false;
+      const cw = wdByDate[d].calWeek;
+      if (byHcp.get(h).some(o => o !== v && wdByDate[o.date] && wdByDate[o.date].calWeek === cw)) return false;
+      if (h._officeKey) {
+        let n = officeWeek[h._officeKey + '|' + cw] || 0;
+        if (leaving && leaving.hcpRef && leaving.hcpRef._officeKey === h._officeKey && wdByDate[leaving.date].calWeek === cw) n--;
+        if (wdByDate[v.date].calWeek === cw) n--;
+        if (n > 0) return false;
+      }
+      return true;
+    };
+    const routeCost = arr => {
+      if (!arr.length) return 0;
+      let t = legMin(HOME, arr[0]);
+      for (let i = 1; i < arr.length; i++) t += legMin(arr[i - 1], arr[i]);
+      return t + legMin(arr[arr.length - 1], HOME);
+    };
+    const fits = arr => {
+      let t = legTime(HOME, arr[0]) + arr.length * slot;
+      for (let i = 1; i < arr.length; i++) t += legTime(arr[i - 1], arr[i]);
+      return t <= dayMin;
+    };
+    const withInsert = (arr, v) => {          // cheapest insertion → new array
+      let best = Infinity, pos = 0;
+      for (let i = 0; i <= arr.length; i++) {
+        const a = i ? arr[i - 1] : HOME, b = i < arr.length ? arr[i] : HOME;
+        const d = legMin(a, v) + legMin(v, b) - legMin(a, b);
+        if (d < best) { best = d; pos = i; }
+      }
+      return [...arr.slice(0, pos), v, ...arr.slice(pos)];
+    };
+    // Cheapest insertion of v into arr (optionally with `skip` removed), without building arrays
+    const insDelta = (arr, v, skip) => {
+      let best = Infinity, prev = HOME;
+      for (let i = 0; i <= arr.length; i++) {
+        const nx = i < arr.length ? arr[i] : HOME;
+        if (nx === skip) continue;
+        const d = legMin(prev, v) + legMin(v, nx) - (prev === HOME && nx === HOME ? 0 : legMin(prev, nx));   // empty day: no home→home leg
+        if (d < best) best = d;
+        prev = nx;
+      }
+      return best;
+    };
+    const remDelta = (arr, v) => {
+      const i = arr.indexOf(v), a = i ? arr[i - 1] : HOME, b = i < arr.length - 1 ? arr[i + 1] : HOME;
+      return (a === HOME && b === HOME ? 0 : legMin(a, b)) - legMin(a, v) - legMin(v, b);
+    };
+    const totalDrive = () => Object.values(days).reduce((s, a) => s + routeCost(a), 0);
+    const totalSpacing = () => { let p = 0; byHcp.forEach((_, h) => { p += spacingPen(h); }); return p; };
+    const driveBefore = totalDrive(), spaceBefore = totalSpacing();
+
+    const moveTo = (v, d, newArrFrom, newArrTo) => {
+      const from = v.date, wFrom = wdByDate[from], wTo = wdByDate[d];
+      days[from] = newArrFrom; days[d] = newArrTo;
+      if (v.hcpRef._officeKey) {
+        officeWeek[v.hcpRef._officeKey + '|' + wFrom.calWeek]--;
+        const k = v.hcpRef._officeKey + '|' + wTo.calWeek; officeWeek[k] = (officeWeek[k] || 0) + 1;
+      }
+      v.date = d;
+      v.week = `W${String(wTo.week).padStart(2, '0')}`;
+      v.weekNum = wTo.week;
+      v.day = new Date(d + 'T00:00:00').toLocaleDateString('en-US', { weekday: 'long' });
+      if (!/rebalanced/.test(v.notes || '')) v.notes = (v.notes ? v.notes + ' · ' : '') + 'rebalanced';
+      _improvedDates.add(from); _improvedDates.add(d);
+      penNow.delete(v.hcpRef);
+    };
+
+    let moves = 0, swaps = 0, timedOut = false;
+    for (let pass = 0; pass < MAX_PASSES && !timedOut; pass++) {
+      let improved = 0;
+      const vs = allVisits.filter(movable);
+      // Relocations
+      for (const v of vs) {
+        if (Date.now() - t0 > TIME_BUDGET_MS) { timedOut = true; break; }
+        if (!movable(v)) continue;
+        const A = days[v.date];
+        const dA = remDelta(A, v);
+        const sp0 = pen(v.hcpRef);
+        let best = null;
+        for (const w of workDays) {
+          const d = w.date;
+          if (d === v.date || frozen[d] !== false || calls(d) >= C.dailyTarget) continue;
+          const g0 = dA + insDelta(days[d], v);
+          if (g0 - SPACING_WEIGHT * sp0 >= -0.5) continue;                 // can't win even with perfect spacing
+          if (!canPlace(v, d)) continue;
+          const gain = g0 + SPACING_WEIGHT * (spacingPen(v.hcpRef, v, d) - sp0);
+          if (gain >= -0.5 || (best && gain >= best.gain)) continue;
+          const B2 = withInsert(days[d], v);
+          if (fits(B2)) best = { gain, d, B2 };
+        }
+        if (best) { moveTo(v, best.d, A.filter(o => o !== v), best.B2); moves++; improved++; }
+      }
+      // Swaps (drive-only swaps stay within a week of each other)
+      const sv = allVisits.filter(movable);
+      for (let i = 0; i < sv.length && !timedOut; i++) {
+        if ((i & 15) === 0 && Date.now() - t0 > TIME_BUDGET_MS) { timedOut = true; break; }
+        const a = sv[i], wa = wdByDate[a.date].week, pa = pen(a.hcpRef) > 0;
+        for (let j = i + 1; j < sv.length; j++) {
+          const b = sv[j];
+          if (a.date === b.date || a.hcpRef === b.hcpRef) continue;
+          // Far-apart swaps only help spacing — skip them unless one doctor is bunched now
+          if (!pa && Math.abs(wa - wdByDate[b.date].week) > 1 && !(pen(b.hcpRef) > 0)) continue;
+          const A = days[a.date], B = days[b.date];
+          const g0 = remDelta(A, a) + insDelta(A, b, a) + remDelta(B, b) + insDelta(B, a, b);
+          if (g0 - SPACING_WEIGHT * (pen(a.hcpRef) + pen(b.hcpRef)) >= -0.5) continue;
+          if (!canPlace(a, b.date, b) || !canPlace(b, a.date, a)) continue;
+          const gain = g0 + SPACING_WEIGHT * (spacingPen(a.hcpRef, a, b.date) - pen(a.hcpRef) + spacingPen(b.hcpRef, b, a.date) - pen(b.hcpRef));
+          if (gain >= -0.5) continue;
+          const A2 = withInsert(A.filter(o => o !== a), b), B2 = withInsert(B.filter(o => o !== b), a);
+          if (!fits(A2) || !fits(B2)) continue;
+          const da = a.date, db = b.date;
+          moveTo(a, db, A.filter(o => o !== a), B.filter(o => o !== b));   // indexes first…
+          moveTo(b, da, B2, A2);                                            // …then the final routes (b leaves db → B2, joins da → A2)
+          swaps++; improved++;
+          break;   // a has moved — continue with the next a
+        }
+      }
+      if (!improved) break;
+    }
+
+    // Polish each touched day (2-opt + single-stop relocation, home → … → home) and keep that order
+    const polish = arr => {
+      let best = arr.slice(), bestC = routeCost(best), imp = true;
+      while (imp) {
+        imp = false;
+        for (let i = 0; i < best.length - 1; i++) for (let j = i + 1; j < best.length; j++) {
+          const c = best.slice(0, i).concat(best.slice(i, j + 1).reverse(), best.slice(j + 1)), cc = routeCost(c);
+          if (cc < bestC - 0.01) { best = c; bestC = cc; imp = true; }
+        }
+        for (let i = 0; i < best.length; i++) for (let j = 0; j < best.length; j++) {
+          if (i === j) continue;
+          const w = best.filter((_, k) => k !== i); w.splice(j, 0, best[i]);
+          const cc = routeCost(w);
+          if (cc < bestC - 0.01) { best = w; bestC = cc; imp = true; }
+        }
+      }
+      return best;
+    };
+    _improvedDates.forEach(d => { if (days[d] && !days[d].some(v => v.isLunch)) _improvedOrder[d] = polish(days[d]); });
+
+    // Keep doctor bookkeeping in step with the moved visits
+    byHcp.forEach((vs, h) => {
+      h.weeksVisited = [...new Set(vs.map(v => wdByDate[v.date] && wdByDate[v.date].calWeek).filter(Boolean))];
+      h.lastVisitDate = vs.map(v => v.date).sort().pop() || h.lastVisitDate;
+    });
+    if (moves || swaps) {
+      addLog(`[IMPROVE] Quarter pass: ${moves} move(s), ${swaps} swap(s) · drive ${Math.round(driveBefore)} → ${Math.round(totalDrive())} min`
+        + ` (${road ? 'road drive times' : 'estimated'}) · spacing shortfall ${spaceBefore} → ${totalSpacing()} week(s)` + (timedOut ? ' · stopped at time limit' : ''));
+    } else {
+      addLog('[IMPROVE] Quarter pass: no improving moves found');
+    }
+  })();
+  if (_improvedDates.size) _ciqReseqDays([..._improvedDates], 1, _improvedOrder);
+  // ── END QUARTER IMPROVEMENT PASS ───────────────────────────────────────────
 
   // Preserve locked day visits — never overwrite WHICH HCPs are on locked days,
   // but DO re-sequence their order using the same optimizer. The zigzag problem

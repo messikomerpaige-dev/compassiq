@@ -69,3 +69,33 @@ that) and to the re-sequencing pass after mop-up.
 **Routing server:** The **Routing server** field sets the OSRM-compatible server used to fetch
 drive times. Leave it blank to use the free public server (`router.project-osrm.org`), which is
 for testing only. Clients need your own OSRM server or a commercial OSRM-compatible one.
+
+## Quarter improvement pass (v4.6)
+
+After every other planning pass, a local search runs over the whole quarter. It moves a visit to
+another day, or swaps two visits between days, whenever that lowers:
+
+- **total drive minutes:** home → stops → home on every day, using road minutes when cached;
+- **plus 15 minutes for every week a doctor's visits are bunched.** Visits should be at least
+  about 60% of the even gap apart (plan weeks ÷ visits). Set `STATE.config.spacingWeight` to change the 15.
+
+It leaves these alone:
+- locked days, half-days, hotel/sweep days and overnight-distance days;
+- meals (and it doesn't add visits to meal days);
+- by-appointment doctors, and doctors with an alternate address, late opening, early closing or a
+  preferred window on that day;
+- group-practice visits that are seen together.
+
+It never moves a doctor's first visit later, so new, trend-flagged and not-yet-reached doctors stay
+early. It respects the daily call target, availability, the once-a-week limit per doctor and per
+office, and the workday length. Touched days are re-timed in the improved order. The pass is capped
+at 2.5 seconds, and the plan log shows an `[IMPROVE]` line with the before/after numbers.
+
+Results on test territories (same calls, no rule violations):
+
+| Territory | Drive time | Bunched visits (weeks short) |
+|---|---|---|
+| 40 doctors | −5% | 88 → 0 |
+| 250 doctors | −6% | 277 → 0 |
+| 250 doctors with restrictions | −11% | 267 → 18 |
+| Demo file (90 doctors) | −19% | 103 → 13 |
