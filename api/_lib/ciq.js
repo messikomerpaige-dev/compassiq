@@ -9,8 +9,12 @@ const AT = 'ciq_at', RT = 'ciq_rt';
 const REFRESH_MAX_AGE = 60 * 60 * 24 * 30;   // 30 days
 
 export function env() {
-  const url = process.env.SUPABASE_URL, anonKey = process.env.SUPABASE_ANON_KEY;
-  const serviceKey = process.env.SUPABASE_SERVICE_ROLE_KEY;
+  // Accept the URL as Supabase shows it in various places: trims spaces, quotes, a trailing
+  // slash and an API path such as /rest/v1/ (which would otherwise break every auth call)
+  const url = String(process.env.SUPABASE_URL || '').trim().replace(/^['"]|['"]$/g, '')
+    .replace(/\/(rest|auth)\/v1\/?$/, '').replace(/\/+$/, '');
+  const anonKey = String(process.env.SUPABASE_ANON_KEY || '').trim();
+  const serviceKey = String(process.env.SUPABASE_SERVICE_ROLE_KEY || '').trim();
   if (!url || !anonKey || !serviceKey) throw httpError(500, 'Server is not configured (Supabase keys missing)');
   return { url, anonKey, serviceKey };
 }

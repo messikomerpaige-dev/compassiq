@@ -72,7 +72,7 @@
     try {
       const sb = await getClient();
       const { data, error } = await sb.auth.signInWithPassword({ email, password });
-      if (error) throw new Error(/invalid/i.test(error.message) ? 'That email and password don’t match.' : error.message);
+      if (error) throw new Error(/invalid login credentials/i.test(error.message) ? 'That email and password don’t match.' : error.message);
       await api('/api/session', { method: 'POST', body: {
         access_token: data.session.access_token, refresh_token: data.session.refresh_token, expires_in: data.session.expires_in } });
       $('password').value = '';
