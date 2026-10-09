@@ -22,10 +22,25 @@ them to sign in or to the blocked page. The app no longer offers "Save backup" f
 **Sessions:** the browser signs in with Supabase and hands the tokens to the server, which keeps
 them in HttpOnly cookies and refreshes them, so there is one session holder.
 
-**Not yet in Phase 1:** plans, visit outcomes and settings are still saved on the device, and the
-device's data is erased if a different person signs in there, or when access is turned off.
-Phase 2 moves plans to the cloud, adds offline mode, and turns on the live call-activity pull
-(`/api/activity`).
+## What reps enter is kept in the cloud (Phase 2)
+
+| Data | Stored | Who sees it |
+|---|---|---|
+| Doctor preferences: office hours and locations by day, do-not-call, by-appointment-only, and a corrected main address | `hcp_prefs`, one row per doctor per company | Everyone at the company who can see that doctor. The latest edit wins. |
+| Visit outcomes (done / missed) | `visit_outcomes`, per person | The person who logged it, plus owners, admins and managers for their territories |
+| Plan, meals, notes and settings | `rep_state`, per person | Only that person |
+
+How it works:
+- **Syncing:** the app's sync queue (`/api/ping`, `/api/sync`, `/api/prefs`) sends outcomes and
+  preferences shortly after each change. The queue survives being offline.
+- **Shared preferences on open:** the doctor list each person receives includes the company's
+  latest shared preferences and addresses. An edit on the device that hasn't been sent yet is kept.
+- **Plans:** plans and settings upload after changes (`/api/state`). A new iPad, a cleared browser or
+  a second device gets them back when the app opens.
+- **Moving territory:** when an admin moves a rep to another territory, the app opens "Change
+  territory" with the new one picked. Their hours, home ZIP and time off stay the same.
+
+**Not yet:** offline mode and the live call-activity pull (`/api/activity`).
 
 ## Tests
 

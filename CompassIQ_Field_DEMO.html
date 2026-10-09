@@ -6045,6 +6045,8 @@ let _dashMapInitialized = false;
 function renderDashboardMap() {
   const card = document.getElementById('dashboard-map-card');
   if (!card) return;
+  // Map library not loaded (offline or blocked): skip the map instead of breaking whatever called this
+  if (typeof L === 'undefined') { card.style.display = 'none'; return; }
 
   if (STATE.hcps.length === 0) {
     card.style.display = 'none';
@@ -7139,6 +7141,16 @@ function openHCPPrefs(idx) {
       </div>
 
       <div class="hp-panel active" data-hp-panel="hours">
+        <div class="hp-addr" style="margin:0 0 14px;">
+          <div style="font-size:12px;font-weight:600;margin-bottom:6px;">Main office address</div>
+          <div style="display:grid;grid-template-columns:minmax(0,2.2fr) minmax(0,1.3fr) 56px 80px;gap:6px;">
+            <input type="text" class="form-input" id="hcp-addr"  value="${esc(h.address||'')}" placeholder="Street">
+            <input type="text" class="form-input" id="hcp-city"  value="${esc(h.city||'')}"    placeholder="City">
+            <input type="text" class="form-input" id="hcp-state" value="${esc(h.state||'')}"   placeholder="ST" maxlength="2">
+            <input type="text" class="form-input" id="hcp-zip"   value="${esc(h.zip5||'')}"    placeholder="ZIP" maxlength="5" inputmode="numeric">
+          </div>
+          <small style="display:block;color:var(--p3-text-3);margin-top:4px;">Wrong address? Correct it here — routing uses it${(typeof window.CIQSync !== 'undefined' && window.CIQSync.status && window.CIQSync.status().enabled) ? ', and everyone at your company sees the change' : ''}.${h.addrEdited ? ' <b>Corrected</b> from the published address.' : ''}</small>
+        </div>
         <p class="hp-help">Untick days the office is closed. Add a location only if they practice somewhere else that day — routing and the itinerary use it.</p>
         <div class="hp-days">${dayRowsHtml}</div>
       </div>
@@ -7381,6 +7393,32 @@ function saveHCPPrefs(idx) {
     collectMeals();
   }
   
+  // v4.7: corrected main office address (shared with the company in the cloud version)
+  let _addrChanged = false;
+  {
+    const _el = (id) => document.getElementById(id);
+    const _addr = {
+      address: (_el('hcp-addr')?.value || '').trim(), city: (_el('hcp-city')?.value || '').trim(),
+      state: (_el('hcp-state')?.value || '').trim().toUpperCase(), zip5: (_el('hcp-zip')?.value || '').replace(/\D/g, '').slice(0, 5),
+    };
+    const _differs = _el('hcp-addr') && ['address', 'city', 'state', 'zip5'].some(k => String(h[k] || '') !== _addr[k]);
+    if (_differs) {
+      if (!_addr.address || !/^\d{5}$/.test(_addr.zip5) || (typeof ZIP_COORDS !== 'undefined' && !ZIP_COORDS[_addr.zip5])) {
+        showToast('⚠ Address not saved — enter a street and a valid 5-digit ZIP');
+      } else {
+        const _oldZip = String(h.zip5 || '');
+        const _pub = ALL_HCPS.find(a => (h.npi && a.npi && a.npi === h.npi) ||
+          (a.firstName === h.firstName && a.lastName === h.lastName && a.zip5 === h.zip5));
+        [h, _pub].forEach(o => {
+          if (!o) return;
+          Object.assign(o, _addr);
+          if (!o.zip4 || String(o.zip4) === _oldZip) o.zip4 = _addr.zip5;
+          o.addrEdited = true; o.addrEditedAt = new Date().toISOString();
+        });
+        _addrChanged = true;
+      }
+    }
+  }
   h.scheduledLunches = lunches;
   h.doNotCall        = document.getElementById('hcp-dnc')?.checked  || false;
   h.byAppointmentOnly = document.getElementById('hcp-appt')?.checked || false;
@@ -7391,6 +7429,7 @@ function saveHCPPrefs(idx) {
     (h.npi && a.npi && a.npi === h.npi) ||
     (a.firstName === h.firstName && a.lastName === h.lastName && a.zip5 === h.zip5)
   );
+  if (_addrChanged) showToast('✓ Address updated — rebuild your plan to route to the new address');
   if (_allIdx >= 0) {
     ALL_HCPS[_allIdx].daySchedule       = h.daySchedule;
     ALL_HCPS[_allIdx].officeHours       = h.officeHours;
@@ -20637,9 +20676,10 @@ const _ADMIN_PW_KEY  = 'tiq_admin_pw';
   // ── What we send ────────────────────────────────────────────────────
   function prefsOf(h) {
     return { npi: String(h.npi || ''), hcpName: ((h.firstName || '') + ' ' + (h.lastName || '')).trim(), territory: terr(),
-             daySchedule: h.daySchedule || null, doNotCall: !!h.doNotCall, byAppointmentOnly: !!h.byAppointmentOnly };
+             daySchedule: h.daySchedule || null, doNotCall: !!h.doNotCall, byAppointmentOnly: !!h.byAppointmentOnly,
+             address: h.addrEdited ? { address: h.address || '', city: h.city || '', state: h.state || '', zip5: String(h.zip5 || ''), zip4: String(h.zip4 || h.zip5 || '') } : null };
   }
-  function prefsSig(p) { return JSON.stringify([p.daySchedule, p.doNotCall, p.byAppointmentOnly]); }
+  function prefsSig(p) { return JSON.stringify([p.daySchedule, p.doNotCall, p.byAppointmentOnly, p.address]); }
 
   // Compare current state with what was last sent; queue the differences
   function scan() {
@@ -20671,7 +20711,7 @@ const _ADMIN_PW_KEY  = 'tiq_admin_pw';
     (STATE.hcps || []).forEach(function (h) {
       if (!h.npi) return;
       var p = prefsOf(h), sig = prefsSig(p), had = seen.p[p.npi];
-      var isDefault = !p.daySchedule && !p.doNotCall && !p.byAppointmentOnly;
+      var isDefault = !p.daySchedule && !p.doNotCall && !p.byAppointmentOnly && !p.address;
       if (had === undefined && isDefault) { seen.p[p.npi] = sig; return; }   // nothing entered yet
       if (had !== sig) { p.updatedAt = new Date().toISOString(); q.prefs[p.npi] = p; seen.p[p.npi] = sig; changed = true; }
     });
@@ -20779,7 +20819,8 @@ const _ADMIN_PW_KEY  = 'tiq_admin_pw';
       })
       .catch(function () {});
   }
-  window.CIQSync = { status: function () { return { enabled: enabled, email: me, pending: pending(), last: load(LAST_KEY, {}) }; }, flush: flush, scan: scan };
+  window.CIQSync = { status: function () { return { enabled: enabled, email: me, pending: pending(), last: load(LAST_KEY, {}) }; }, flush: flush, scan: scan,
+    prefsOf: prefsOf, prefsSig: prefsSig };
   if (document.readyState === 'loading') document.addEventListener('DOMContentLoaded', function () { setTimeout(start, 800); });
   else setTimeout(start, 800);
 })();
@@ -20936,7 +20977,25 @@ const _ADMIN_PW_KEY  = 'tiq_admin_pw';
     var fresh = ALL_HCPS.filter(function (h) { return h.territory === t; });
     if (!fresh.length) return false;
     var prev = STATE.hcps, manual = prev.filter(function (h) { return !h.territory; });
-    STATE.hcps = mergeHCPPrefs(fresh.map(function (h) { return Object.assign({}, h); }), prev).concat(manual);
+    var merged = mergeHCPPrefs(fresh.map(function (h) { return Object.assign({}, h); }), prev);
+    var unsent = {}, seen = null;
+    try { unsent = (JSON.parse(localStorage.getItem('ciq_sync_q')) || {}).prefs || {}; seen = JSON.parse(localStorage.getItem('ciq_sync_seen')); } catch (e) {}
+    var byNpi = {}; fresh.forEach(function (f) { if (f.npi) byNpi[String(f.npi)] = f; });
+    var prevByNpi = {}; prev.forEach(function (p) { if (p.npi) prevByNpi[String(p.npi)] = p; });
+    merged.forEach(function (h) {
+      var f = byNpi[String(h.npi)], p = prevByNpi[String(h.npi)];
+      if (!f) return;
+      if (unsent[String(h.npi)] && p) {                       // this device's edit hasn't reached the cloud yet
+        ['address', 'city', 'state', 'zip5', 'zip4', 'addrEdited', 'addrEditedAt'].forEach(function (k) { if (k in p) h[k] = p[k]; });
+        return;
+      }
+      if (f.prefsAt) {                                        // shared across the company: latest wins
+        h.daySchedule = f.daySchedule || null; h.doNotCall = !!f.doNotCall; h.byAppointmentOnly = !!f.byAppointmentOnly;
+        if (seen && seen.p && window.CIQSync && window.CIQSync.prefsSig) seen.p[String(h.npi)] = window.CIQSync.prefsSig(window.CIQSync.prefsOf(h));
+      }
+    });
+    if (seen) { try { localStorage.setItem('ciq_sync_seen', JSON.stringify(seen)); } catch (e) {} }
+    STATE.hcps = merged.concat(manual);
     saveState();
     return true;
   }

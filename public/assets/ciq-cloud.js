@@ -96,7 +96,52 @@
     ['p3-save', 'backup-btn'].forEach(function (id) { var b = document.getElementById(id); if (b) b.style.display = 'none'; });
   }
 
-  function start() { mount(); prefillWelcome(); noFileBackups(); }
+  // ── Plans and settings saved to the person's account (Phase 2) ───────────
+  // Every save is uploaded (at most every 15 s, and when the app goes to the background), so a new
+  // iPad or a reinstall picks up where they left off. The server sends it back on open when newer.
+  var stateTimer = null, stateDirty = false, stateSending = false;
+  function uploadState() {
+    clearTimeout(stateTimer); stateTimer = null;
+    if (!stateDirty || stateSending || !navigator.onLine) return;
+    var body;
+    try { body = JSON.stringify({ data: { T: TERRITORIES, A: ACTIVE_TERRITORY_ID } }); } catch (e) { return; }
+    stateDirty = false; stateSending = true;
+    fetch('/api/state', { method: 'POST', credentials: 'same-origin', headers: { 'content-type': 'application/json' }, body: body })
+      .then(function (r) { return r.ok ? r.json() : Promise.reject(new Error('HTTP ' + r.status)); })
+      .then(function (d) { try { localStorage.setItem('ciq_state_at', d.at); } catch (e) {} })
+      .catch(function () { stateDirty = true; stateTimer = setTimeout(uploadState, 60000); })
+      .then(function () { stateSending = false; });
+  }
+  function watchState() {
+    var orig = window.saveState;
+    if (typeof orig !== 'function' || orig._ciqState) return;
+    window.saveState = function () {
+      var r = orig.apply(this, arguments);
+      stateDirty = true;
+      if (!stateTimer) stateTimer = setTimeout(uploadState, 15000);
+      return r;
+    };
+    window.saveState._ciqState = true;
+    // Copy any other wrappers' flags (the sync module marks its wrapper too)
+    if (orig._ciqSync) window.saveState._ciqSync = true;
+    document.addEventListener('visibilitychange', function () { if (document.visibilityState === 'hidden') uploadState(); });
+    window.addEventListener('online', function () { if (stateDirty) uploadState(); });
+    window.CIQState = { upload: function () { stateDirty = true; uploadState(); } };
+  }
+
+  // ── Moved to another territory by an admin ────────────────────────────
+  function checkTerritoryMove() {
+    if (me.role !== 'rep' || me.territories.length !== 1) return;
+    var cur = '';
+    try { cur = (TERRITORIES[ACTIVE_TERRITORY_ID] || {}).name || ''; } catch (e) { return; }
+    var assigned = me.territories[0];
+    if (!cur || cur === assigned || typeof window._obOpen !== 'function') return;
+    window._obOpen(true);
+    var lead = document.getElementById('ob-lead');
+    if (lead) lead.textContent = 'Your admin moved you to ' + assigned + '. Confirm your home ZIP to load its doctors — your hours, home ZIP and time off stay the same.';
+  }
+
+  function start() { mount(); prefillWelcome(); noFileBackups(); watchState(); setTimeout(checkTerritoryMove, 600); }
   if (document.readyState === 'loading') document.addEventListener('DOMContentLoaded', start);
   else start();
 })();
