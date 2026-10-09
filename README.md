@@ -1,6 +1,43 @@
 # CompassIQ
 
-Territory routing planner for field sales reps.
+Territory routing planner for field sales reps, run as a hosted web app: each client company gets
+its own private space, reps sign in and see only their own territory, and access can be turned off
+for a person or a whole company at any time.
+
+**Putting it online:** see [SETUP.md](SETUP.md).
+
+## How the cloud version works (Phase 1)
+
+| Piece | What it is |
+|---|---|
+| `supabase/migrations/` | Database: companies, territories, people, doctor data. Row level security means people only ever read their own company, and reps only their territories; nothing is readable once a person or company is turned off. All writes go through checked database functions. |
+| `api/` | Vercel serverless functions: sign-in sessions (HttpOnly cookies), the rep app's data feed, company admin, and the CompassIQ team's company controls. |
+| `public/` | Sign-in, set-password, Team & territories (`/admin`), Client companies (`/platform`), and the access-turned-off page. |
+| `scripts/build.mjs` | Builds the rep app (`/app`) and the hosted admin tool (`/admin/tool`) from `CompassIQ_ADMIN.html` on every deploy. |
+
+**The rep app has no data inside.** `/app` is the field template with an empty doctor list. When it
+opens, it loads `/api/app-data`, which returns only the signed-in person's territories, or sends
+them to sign in or to the blocked page. The app no longer offers "Save backup" files.
+
+**Sessions:** the browser signs in with Supabase and hands the tokens to the server, which keeps
+them in HttpOnly cookies and refreshes them, so there is one session holder.
+
+**Not yet in Phase 1:** plans, visit outcomes and settings are still saved on the device, and the
+device's data is erased if a different person signs in there, or when access is turned off.
+Phase 2 moves plans to the cloud, adds offline mode, and turns on the live call-activity pull
+(`/api/activity`).
+
+## Tests
+
+```
+npm install
+npm test            # database access rules + server endpoints (in-memory Postgres)
+npm run test:e2e    # full browser flows (needs Playwright's Chromium)
+```
+
+The tests run the real database migration in PGlite, with a stand-in for Supabase's auth service.
+
+## Files
 
 | File | What it is |
 |---|---|

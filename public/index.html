@@ -1,0 +1,108 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Sign in · CompassIQ</title>
+<link rel="stylesheet" href="/assets/ciq.css">
+</head>
+<body>
+<main class="center">
+  <div class="card">
+    <div class="brand">
+      <svg width="26" height="26" viewBox="0 0 56 56" fill="none" aria-hidden="true"><circle cx="28" cy="28" r="22" stroke="currentColor" stroke-width="2.6"/><path d="M28 10 L34 28 L28 25 L22 28 Z" fill="#7c5cff"/><path d="M28 46 L34 28 L28 31 L22 28 Z" fill="currentColor" opacity=".35"/></svg>
+      <span>Compass<em>IQ</em></span>
+    </div>
+
+    <form id="signin" novalidate>
+      <h1>Sign in</h1>
+      <p class="muted small">Use the email your company invited.</p>
+      <label for="email">Email</label>
+      <input type="email" id="email" autocomplete="username" required>
+      <label for="password">Password</label>
+      <input type="password" id="password" autocomplete="current-password" required>
+      <button class="btn block" id="go" type="submit">Sign in</button>
+      <p style="margin:14px 0 0;"><button type="button" class="linkbtn" id="forgot">Forgot your password?</button></p>
+      <div class="msg" id="msg" role="alert"></div>
+    </form>
+
+    <form id="reset" novalidate hidden>
+      <h1>Reset your password</h1>
+      <p class="muted small">We’ll email you a link to set a new password.</p>
+      <label for="reset-email">Email</label>
+      <input type="email" id="reset-email" autocomplete="username" required>
+      <button class="btn block" id="reset-go" type="submit">Send reset link</button>
+      <p style="margin:14px 0 0;"><button type="button" class="linkbtn" id="back">Back to sign in</button></p>
+      <div class="msg" id="reset-msg" role="alert"></div>
+    </form>
+  </div>
+</main>
+<script src="https://cdn.jsdelivr.net/npm/@supabase/supabase-js@2.116.0/dist/umd/supabase.js"></script>
+<script src="/assets/ciq-page.js"></script>
+<script>
+(function () {
+  'use strict';
+  const { api, showMsg, safeNext } = window.CIQ;
+  const next = safeNext(new URLSearchParams(location.search).get('next'));
+  const $ = (id) => document.getElementById(id);
+  let client = null;
+
+  async function getClient() {
+    if (client) return client;
+    const cfg = await api('/api/session?config=1');
+    client = window.supabase.createClient(cfg.url, cfg.anonKey, {
+      auth: { persistSession: false, autoRefreshToken: false, detectSessionInUrl: false },
+    });
+    return client;
+  }
+
+  async function goHome() {
+    const me = await api('/api/session');
+    location.replace(next || me.home || '/app');
+  }
+
+  // Already signed in → straight to the right place
+  api('/api/session').then((me) => location.replace(next || me.home)).catch(() => { $('email').focus(); });
+
+  $('signin').addEventListener('submit', async (e) => {
+    e.preventDefault();
+    const email = $('email').value.trim(), password = $('password').value;
+    if (!email || !password) return showMsg($('msg'), 'Enter your email and password.');
+    $('go').disabled = true; showMsg($('msg'), '');
+    try {
+      const sb = await getClient();
+      const { data, error } = await sb.auth.signInWithPassword({ email, password });
+      if (error) throw new Error(/invalid/i.test(error.message) ? 'That email and password don’t match.' : error.message);
+      await api('/api/session', { method: 'POST', body: {
+        access_token: data.session.access_token, refresh_token: data.session.refresh_token, expires_in: data.session.expires_in } });
+      $('password').value = '';
+      await goHome();
+    } catch (err) {
+      showMsg($('msg'), err.message || 'Could not sign in.');
+      $('go').disabled = false;
+    }
+  });
+
+  $('forgot').addEventListener('click', () => { $('signin').hidden = true; $('reset').hidden = false; $('reset-email').value = $('email').value; $('reset-email').focus(); });
+  $('back').addEventListener('click', () => { $('reset').hidden = true; $('signin').hidden = false; $('email').focus(); });
+
+  $('reset').addEventListener('submit', async (e) => {
+    e.preventDefault();
+    const email = $('reset-email').value.trim();
+    if (!email) return showMsg($('reset-msg'), 'Enter your email.');
+    $('reset-go').disabled = true;
+    try {
+      const sb = await getClient();
+      const { error } = await sb.auth.resetPasswordForEmail(email, { redirectTo: location.origin + '/set-password' });
+      if (error) throw error;
+      showMsg($('reset-msg'), 'If that email has a CompassIQ login, a reset link is on its way.', 'ok');
+    } catch (err) {
+      showMsg($('reset-msg'), err.message || 'Could not send the link.');
+    } finally {
+      $('reset-go').disabled = false;
+    }
+  });
+})();
+</script>
+</body>
+</html>

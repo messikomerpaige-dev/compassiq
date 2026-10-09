@@ -1,0 +1,219 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Team &amp; territories · CompassIQ</title>
+<link rel="stylesheet" href="/assets/ciq.css">
+</head>
+<body>
+<header class="topbar">
+  <div class="brand">
+    <svg width="24" height="24" viewBox="0 0 56 56" fill="none" aria-hidden="true"><circle cx="28" cy="28" r="22" stroke="currentColor" stroke-width="2.6"/><path d="M28 10 L34 28 L28 25 L22 28 Z" fill="#7c5cff"/><path d="M28 46 L34 28 L28 31 L22 28 Z" fill="currentColor" opacity=".35"/></svg>
+    <span>Compass<em>IQ</em></span>
+    <span class="muted" style="font-weight:400;font-size:14px;" id="org-name"></span>
+  </div>
+  <div class="who">
+    <a href="/app">Open CompassIQ</a>
+    <a href="/admin/tool">Load &amp; publish doctor data</a>
+    <span id="me"></span>
+    <button class="btn secondary sm" id="signout" type="button">Sign out</button>
+  </div>
+</header>
+
+<main class="wrap">
+  <div class="msg" id="page-msg" role="alert"></div>
+
+  <section class="panel">
+    <div class="panel-head"><h2>Overview</h2><span class="muted small" id="last-publish"></span></div>
+    <div class="stats" id="stats"></div>
+  </section>
+
+  <section class="panel">
+    <div class="panel-head">
+      <h2>Team</h2>
+      <button class="btn sm" id="invite-open" type="button">Invite someone</button>
+    </div>
+    <div class="table-wrap"><table>
+      <thead><tr><th>Name</th><th>Role</th><th>Territories</th><th>Status</th><th></th></tr></thead>
+      <tbody id="people"></tbody>
+    </table></div>
+  </section>
+
+  <section class="panel">
+    <div class="panel-head"><h2>Territories</h2><span class="muted small">Territories come from the doctor file you publish.</span></div>
+    <div class="table-wrap"><table>
+      <thead><tr><th>Territory</th><th>Doctors</th><th>People</th></tr></thead>
+      <tbody id="territories"></tbody>
+    </table></div>
+  </section>
+</main>
+
+<dialog id="person-dlg">
+  <form id="person-form" method="dialog" novalidate>
+    <h2 id="person-title">Invite someone</h2>
+    <p class="muted small" id="person-sub">They’ll get an email to set their password.</p>
+    <div id="email-row">
+      <label for="p-email">Email</label>
+      <input type="email" id="p-email" autocomplete="off">
+    </div>
+    <label for="p-name">Name</label>
+    <input type="text" id="p-name" autocomplete="off">
+    <label for="p-role">Role</label>
+    <select id="p-role">
+      <option value="rep">Rep — sees one territory</option>
+      <option value="manager">Manager — sees the territories you pick</option>
+      <option value="admin">Admin — manages the team and data</option>
+      <option value="owner">Owner — admin, plus manages admins</option>
+    </select>
+    <label>Territories</label>
+    <div class="checks" id="p-terrs"></div>
+    <p class="muted small" id="p-terr-hint"></p>
+    <div class="msg" id="person-msg" role="alert"></div>
+    <div class="dialog-actions">
+      <button class="btn secondary" value="cancel" type="button" id="person-cancel">Cancel</button>
+      <button class="btn" id="person-save" type="submit">Send invite</button>
+    </div>
+  </form>
+</dialog>
+
+<script src="/assets/ciq-page.js"></script>
+<script>
+(function () {
+  'use strict';
+  const { api, h, showMsg, signOut, fmtDate } = window.CIQ;
+  const $ = (id) => document.getElementById(id);
+  let state = null, editing = null;
+
+  $('signout').addEventListener('click', signOut);
+
+  async function load() {
+    try {
+      const me = await api('/api/session');
+      if (!me.access.active || !['owner', 'admin'].includes(me.access.member.role)) return location.replace(me.home || '/');
+      $('me').textContent = me.email;
+      state = await api('/api/admin');
+      render();
+    } catch (e) {
+      if (e.status === 401) return location.replace('/?next=/admin');
+      showMsg($('page-msg'), e.message);
+    }
+  }
+
+  function terrName(id) { const t = state.territories.find((x) => x.id === id); return t ? t.name : '—'; }
+
+  function render() {
+    $('org-name').textContent = '· ' + state.org.name;
+    const lp = state.last_publish;
+    $('last-publish').textContent = lp ? 'Doctor data last published ' + fmtDate(lp.at) : 'No doctor data published yet';
+    const active = state.members.filter((m) => m.status === 'active');
+    const doctors = state.territories.reduce((s, t) => s + t.hcp_count, 0);
+    $('stats').replaceChildren(
+      ...[[active.length, 'active people'], [state.territories.length, 'territories'], [doctors.toLocaleString(), 'doctors'],
+        [state.members.filter((m) => m.role === 'rep' && m.status === 'active').length, 'active reps']]
+        .map(([n, l]) => h('div', { class: 'stat' }, h('b', {}, String(n)), h('span', {}, l))));
+
+    const myRole = state.me.role;
+    $('people').replaceChildren(...(state.members.length ? state.members.map((m) => {
+      const isMe = m.user_id === state.me.user_id;
+      const canEdit = !isMe && (myRole === 'owner' || !['owner', 'admin'].includes(m.role));
+      const terrs = ['owner', 'admin'].includes(m.role) ? 'All' : (m.territory_ids.map(terrName).join(', ') || '—');
+      return h('tr', {},
+        h('td', {}, h('div', {}, m.full_name || m.email), m.full_name ? h('div', { class: 'muted small' }, m.email) : null),
+        h('td', {}, h('span', { class: 'pill role' }, m.role)),
+        h('td', { class: 'small' }, terrs),
+        h('td', {}, h('span', { class: 'pill ' + (m.status === 'active' ? 'ok' : 'off') }, m.status === 'active' ? 'Active' : 'Turned off')),
+        h('td', {}, canEdit ? h('div', { class: 'row-actions' },
+          h('button', { class: 'btn secondary sm', type: 'button', onclick: () => openPerson(m) }, 'Edit'),
+          m.status === 'active'
+            ? h('button', { class: 'btn danger sm', type: 'button', onclick: () => setStatus(m, 'disabled') }, 'Turn off')
+            : h('button', { class: 'btn secondary sm', type: 'button', onclick: () => setStatus(m, 'active') }, 'Turn on'))
+          : h('span', { class: 'muted small' }, isMe ? 'You' : '')));
+    }) : [h('tr', {}, h('td', { colspan: 5, class: 'empty' }, 'No one yet.'))]));
+
+    $('territories').replaceChildren(...(state.territories.length ? state.territories.map((t) => {
+      const people = state.members.filter((m) => m.status === 'active' && m.territory_ids.includes(t.id));
+      return h('tr', {}, h('td', {}, t.name), h('td', { class: 'num' }, t.hcp_count.toLocaleString()),
+        h('td', { class: 'small' }, people.map((m) => m.full_name || m.email).join(', ') || h('span', { class: 'muted' }, 'No one assigned')));
+    }) : [h('tr', {}, h('td', { colspan: 3, class: 'empty' },
+      'No territories yet. Open “Load & publish doctor data”, load your doctor file, and publish it.'))]));
+
+    // Owners can grant every role; admins only manager and rep
+    [...$('p-role').options].forEach((o) => { o.disabled = myRole !== 'owner' && ['owner', 'admin'].includes(o.value); });
+  }
+
+  function renderTerritoryChoices(selected) {
+    const role = $('p-role').value, multi = role === 'manager';
+    const all = ['owner', 'admin'].includes(role);
+    $('p-terr-hint').textContent = all ? 'Owners and admins see every territory.' : multi ? 'Pick one or more.' : 'Pick the rep’s territory.';
+    $('p-terrs').replaceChildren(...(all ? [] : state.territories.length ? state.territories.map((t) =>
+      h('label', {}, h('input', { type: multi ? 'checkbox' : 'radio', name: 'terr', value: t.id, checked: selected.includes(t.id) }), t.name))
+      : [h('span', { class: 'empty' }, 'Publish doctor data first to create territories.')]));
+  }
+
+  function openPerson(m) {
+    editing = m || null;
+    showMsg($('person-msg'), '');
+    $('person-title').textContent = m ? 'Edit ' + (m.full_name || m.email) : 'Invite someone';
+    $('person-sub').textContent = m ? m.email : 'They’ll get an email to set their password.';
+    $('email-row').hidden = !!m;
+    $('p-email').value = '';
+    $('p-name').value = m ? m.full_name : '';
+    $('p-role').value = m ? m.role : 'rep';
+    $('person-save').textContent = m ? 'Save' : 'Send invite';
+    renderTerritoryChoices(m ? m.territory_ids : []);
+    $('person-dlg').showModal();
+    (m ? $('p-name') : $('p-email')).focus();
+  }
+
+  $('invite-open').addEventListener('click', () => openPerson(null));
+  $('person-cancel').addEventListener('click', () => $('person-dlg').close());
+  $('p-role').addEventListener('change', () => {
+    const keep = [...$('p-terrs').querySelectorAll('input:checked')].map((i) => i.value);
+    renderTerritoryChoices(keep);
+  });
+
+  $('person-form').addEventListener('submit', async (e) => {
+    e.preventDefault();
+    const role = $('p-role').value;
+    const territory_ids = ['owner', 'admin'].includes(role) ? [] : [...$('p-terrs').querySelectorAll('input:checked')].map((i) => i.value);
+    if (role === 'rep' && territory_ids.length !== 1) return showMsg($('person-msg'), 'Pick the rep’s territory.');
+    if (role === 'manager' && !territory_ids.length) return showMsg($('person-msg'), 'Pick at least one territory.');
+    $('person-save').disabled = true;
+    try {
+      if (editing) {
+        await api('/api/admin', { method: 'POST', body: { action: 'update', user_id: editing.user_id, role, territory_ids, full_name: $('p-name').value } });
+        showMsg($('page-msg'), 'Saved.', 'ok');
+      } else {
+        const email = $('p-email').value.trim();
+        const r = await api('/api/admin', { method: 'POST', body: { action: 'invite', email, full_name: $('p-name').value.trim(), role, territory_ids } });
+        showMsg($('page-msg'), r.existing ? email + ' already had a CompassIQ login — they can sign in now.' : 'Invite sent to ' + email + '.', 'ok');
+      }
+      $('person-dlg').close();
+      state = await api('/api/admin');
+      render();
+    } catch (err) {
+      showMsg($('person-msg'), err.message);
+    } finally {
+      $('person-save').disabled = false;
+    }
+  });
+
+  async function setStatus(m, status) {
+    const who = m.full_name || m.email;
+    if (status === 'disabled' && !confirm('Turn off ' + who + '? They lose access right away, and CompassIQ data on their device is erased. You can turn them back on later.')) return;
+    try {
+      await api('/api/admin', { method: 'POST', body: { action: 'update', user_id: m.user_id, status } });
+      showMsg($('page-msg'), status === 'disabled' ? who + ' is turned off.' : who + ' is turned back on.', 'ok');
+      state = await api('/api/admin');
+      render();
+    } catch (err) {
+      showMsg($('page-msg'), err.message);
+    }
+  }
+
+  load();
+})();
+</script>
+</body>
+</html>
