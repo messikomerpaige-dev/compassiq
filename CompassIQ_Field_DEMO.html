@@ -20538,9 +20538,32 @@ const _ADMIN_PW_KEY  = 'tiq_admin_pw';
           lines.push('<span class="bp-pro">Partial quarter: ' + span + ' (' + Math.round(fw.factor * 100) + '%). Call goals are prorated — ' + segTxt + ' calls per doctor. <b>' + hs.length + '</b> doctors need about <b>' + need + '</b> calls.</span>');
         }
       }
+      // v4.7: a plan that ends with its quarter after only a few working days almost always has the
+      // wrong start date (e.g. Sep 28 for a Q4 plan) — every doctor would be prorated to ~1 call
+      if (fw && fw.end === fw.quarter.end && fw.planDays <= 10) {
+        var dayAfter = new Date(fw.end + 'T00:00:00'); dayAfter.setDate(dayAfter.getDate() + 1);
+        var next = mondayOnOrAfter(dayAfter);
+        var thisMon = new Date(now); thisMon.setDate(now.getDate() - ((now.getDay() + 6) % 7));
+        if (thisMon > next) next = thisMon;
+        var nextIso = isoOf(next), nq = _ciqQuarterOf(nextIso).q;
+        lines.unshift('<span class="bp-warn" style="display:block;padding:10px 12px;margin-bottom:6px;border-radius:10px;'
+          + 'background:rgba(217,119,6,0.12);border:1px solid rgba(217,119,6,0.35);">⚠ This plan only covers <b>' + fw.planDays
+          + ' working day' + (fw.planDays === 1 ? '' : 's') + '</b>: it ends <b>' + fmt(fw.end) + '</b>, the last day of Q' + fw.quarter.q
+          + ', so each doctor gets only about 1 call. '
+          + '<button type="button" class="btn btn-primary btn-sm" style="margin-left:4px;" onclick="_bpUseStart(\'' + nextIso + '\')">Start '
+          + next.toLocaleDateString('en-US', { weekday: 'short', month: 'short', day: 'numeric' }) + ' (Q' + nq + ') instead</button></span>');
+      }
       sum.innerHTML = lines.join('<br>');
     }
     if (go) go.textContent = (STATE.plan && STATE.plan.length) ? 'Rebuild my plan' : 'Build my plan';
+  };
+  // One-click fix from the short-plan warning: new start, last day back to that quarter's end
+  window._bpUseStart = function (iso) {
+    var sd = document.getElementById('plan-start-date'), ed = document.getElementById('plan-end-date');
+    if (!sd) return;
+    sd.value = iso;
+    if (ed) { ed.value = ''; ed.dataset.auto = '1'; }
+    window._bpWindowChanged(sd);
   };
   // Start / last day edited on Build plan: keep the default end in step, refresh preview
   window._bpWindowChanged = function (el) {

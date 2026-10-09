@@ -213,6 +213,29 @@ test('a rep gets only their territory, and can build a plan', async () => {
   assert.deepEqual(page.errors, []);
 });
 
+test('Build plan warns when a plan only covers the end of a quarter, and fixes it in one click', async () => {
+  const page = await newPage();
+  await signIn(page, 'rep1@acme.test', 'rep1-password-1', '/app');
+  await page.waitForFunction(() => typeof _bpPrefill === 'function' && document.querySelector('.ciq-acct'), null, { timeout: 60000 });
+  const r = await page.evaluate(() => {
+    const sd = document.getElementById('plan-start-date'), ed = document.getElementById('plan-end-date');
+    const warn = () => document.querySelector('#bp-sum .bp-warn');
+    sd.value = '2026-09-28'; _bpWindowChanged(sd);
+    const before = { end: ed.value, warn: warn() && warn().textContent };
+    warn().querySelector('button').click();
+    const after = { start: sd.value, end: ed.value, weekday: new Date(sd.value + 'T00:00:00').getDay(), warn: !!warn() };
+    sd.value = '2026-10-12'; _bpWindowChanged(sd);
+    return { before, after, normal: !!warn() };
+  });
+  assert.equal(r.before.end, '2026-09-30');
+  assert.match(r.before.warn, /only covers 3 working days: it ends Sep 30, the last day of Q3[\s\S]*Start Mon, \w+ \d+ \(Q4\) instead/);
+  assert.ok(r.after.start >= '2026-10-01' && r.after.weekday === 1, JSON.stringify(r.after));
+  assert.equal(r.after.end, '2026-12-31');
+  assert.equal(r.after.warn, false);
+  assert.equal(r.normal, false, 'no warning for a normal Q4 start');
+  assert.deepEqual(page.errors, []);
+});
+
 test('a manager gets their territories; signed-out visitors are sent to sign in', async () => {
   const page = await newPage();
   await signIn(page, 'mgr@acme.test', 'mgr-password-1', '/app');
