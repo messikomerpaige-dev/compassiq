@@ -9,8 +9,12 @@ const AT = 'ciq_at', RT = 'ciq_rt';
 const REFRESH_MAX_AGE = 60 * 60 * 24 * 30;   // 30 days
 
 export function env() {
-  const url = process.env.SUPABASE_URL, anonKey = process.env.SUPABASE_ANON_KEY;
-  const serviceKey = process.env.SUPABASE_SERVICE_ROLE_KEY;
+  // Accept the URL as Supabase shows it in various places: trims spaces, quotes, a trailing
+  // slash and an API path such as /rest/v1/ (which would otherwise break every auth call)
+  const url = String(process.env.SUPABASE_URL || '').trim().replace(/^['"]|['"]$/g, '')
+    .replace(/\/(rest|auth)\/v1\/?$/, '').replace(/\/+$/, '');
+  const anonKey = String(process.env.SUPABASE_ANON_KEY || '').trim();
+  const serviceKey = String(process.env.SUPABASE_SERVICE_ROLE_KEY || '').trim();
   if (!url || !anonKey || !serviceKey) throw httpError(500, 'Server is not configured (Supabase keys missing)');
   return { url, anonKey, serviceKey };
 }
@@ -63,6 +67,7 @@ export async function getSession(req, res) {
   if (c[AT]) {
     const { data, error } = await anonClient().auth.getUser(c[AT]);
     if (!error && data && data.user) return { user: data.user, accessToken: c[AT] };
+    console.warn('[session] access token rejected:', (error && (error.code || error.message)) || 'no user');
   }
   if (c[RT]) {
     const { data, error } = await anonClient().auth.refreshSession({ refresh_token: c[RT] });
@@ -70,7 +75,10 @@ export async function getSession(req, res) {
       setSessionCookies(req, res, data.session);
       return { user: data.user, accessToken: data.session.access_token };
     }
+    console.warn('[session] refresh failed:', (error && (error.code || error.message)) || 'no session');
     clearSessionCookies(req, res);
+  } else if (!c[AT]) {
+    console.warn('[session] no session cookies on', req.url || '(request)');
   }
   return null;
 }

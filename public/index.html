@@ -61,6 +61,9 @@
     location.replace(next || me.home || '/app');
   }
 
+  if (new URLSearchParams(location.search).get('saved')) {
+    showMsg($('msg'), 'Your password is saved — sign in with it now.', 'ok');
+  }
   // Already signed in → straight to the right place
   api('/api/session').then((me) => location.replace(next || me.home)).catch(() => { $('email').focus(); });
 
@@ -72,7 +75,7 @@
     try {
       const sb = await getClient();
       const { data, error } = await sb.auth.signInWithPassword({ email, password });
-      if (error) throw new Error(/invalid/i.test(error.message) ? 'That email and password don’t match.' : error.message);
+      if (error) throw new Error(/invalid login credentials/i.test(error.message) ? 'That email and password don’t match.' : error.message);
       await api('/api/session', { method: 'POST', body: {
         access_token: data.session.access_token, refresh_token: data.session.refresh_token, expires_in: data.session.expires_in } });
       $('password').value = '';
