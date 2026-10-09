@@ -5727,7 +5727,7 @@ function renderActivityCard() {
       <tbody>${types.map(t => `<tr><td>${t.replace(/[<>&"]/g, '')}</td><td class="td-mono">${byType[t]}</td>
         <td><input type="checkbox" ${ex.has(t) ? '' : 'checked'} onchange="setActivityTypeCounted(${JSON.stringify(t).replace(/"/g, '&quot;')}, this.checked)"></td></tr>`).join('')}</tbody></table></div>` : '';
   el.innerHTML = `
-    <div class="trend-status">${status}</div>
+    <div class="trend-status">${status}${STATE.actPlannedAsOf && a0 && STATE.actPlannedAsOf === a0.asOf && STATE.actPlannedFrom ? `<div style="margin-top:6px;">✓ Your plan was rebuilt from <b>${new Date(STATE.actPlannedFrom + 'T00:00:00').toLocaleDateString('en-US', { month: 'short', day: 'numeric' })}</b> using these calls. New activity rebuilds it again automatically.</div>` : ''}</div>
     ${typeRows}
     <div class="flex gap-8" style="flex-wrap:wrap;margin-top:12px;">
       <button class="btn btn-primary btn-sm" onclick="document.getElementById('activity-file-input').click()">Load call activity file</button>
@@ -8458,12 +8458,18 @@ function generateQuarter() {
   if (_pw) addLog(`[WINDOW] ${_pw.start} → ${_pw.end} · ${_pw.planDays} of ${_pw.quarterDays} working days in Q${_pw.quarter.q}` + (_pw.full ? ' · full-quarter goals' : ` · goals prorated to ${Math.round(_pw.factor * 100)}%`));
   addLog(`[CONFIG] Target: ${C.dailyTarget} calls/day | Appt: ${C.apptMin}min | Buffer: ${C.bufferMin}min | Day: ${dayMin}min`);
 
+  // v4.7: days already covered by this quarter's call activity are not planned again
+  const _ciqActThrough = window._ciqActSkipThrough || (() => {
+    const a = (STATE.hcps || []).find(h => h.act && h.act.asOf && typeof _actQuarterKey === 'function' && h.act.q === _actQuarterKey(startDateVal));
+    return a ? a.act.asOf : null;
+  })();
+  if (_ciqActThrough && _ciqActThrough >= startDateVal) addLog(`[ACTIVITY] Days through ${_ciqActThrough} are covered by call activity — planning starts after them`);
   // Build working-day list
   const workDays = [];
   for (let i = 0; i < weeksN * 7; i++) {
     const ds = addDays(startDateVal, i);
     if (_pw && ds > _pw.end) break;
-    if (!isBlocked(ds) && !isDayLocked(ds)) {
+    if (!isBlocked(ds) && !isDayLocked(ds) && !(_ciqActThrough && ds <= _ciqActThrough)) {
       const d = new Date(ds + 'T00:00:00');
       const week = Math.floor(i / 7) + 1;
       // Also compute calendar week key (Mon-Sun span) for same-week HCP dedup
@@ -20910,5 +20916,89 @@ const _ADMIN_PW_KEY  = 'tiq_admin_pw';
 })();
 </script>
 
+<script>
+/* v4.7 ─ Published doctors stay current, and new call activity rebuilds the plan by itself.
+   1. Field builds: on open, this territory's doctors are refreshed from the published list
+      (keeping the rep's own edits — office hours, do-not-call, meals — and doctors they added).
+   2. When call activity arrives (published, loaded from a file, or pulled live), its "calls through"
+      date is read and the plan is rebuilt from the next working day to the end of the quarter,
+      planning only the calls each doctor still needs. Days up to that date are not planned again. */
+(function () {
+  'use strict';
+  function isFieldBuild() { try { return typeof __CLEARPATH_IS_FIELD_BUILD__ !== 'undefined' && __CLEARPATH_IS_FIELD_BUILD__; } catch (e) { return false; } }
+  function terrName() { try { return (TERRITORIES[ACTIVE_TERRITORY_ID] || {}).name || ''; } catch (e) { return ''; } }
+  function fmt(iso) { return new Date(iso + 'T00:00:00').toLocaleDateString('en-US', { month: 'short', day: 'numeric' }); }
+  function shift(iso, n) { var d = new Date(iso + 'T00:00:00'); d.setDate(d.getDate() + n); return _ciqIso(d); }
+
+  function refreshFromPublished() {
+    if (!isFieldBuild() || typeof ALL_HCPS === 'undefined' || !Array.isArray(ALL_HCPS) || !ALL_HCPS.length) return false;
+    var t = terrName(); if (!t || !STATE.hcps || !STATE.hcps.length) return false;
+    var fresh = ALL_HCPS.filter(function (h) { return h.territory === t; });
+    if (!fresh.length) return false;
+    var prev = STATE.hcps, manual = prev.filter(function (h) { return !h.territory; });
+    STATE.hcps = mergeHCPPrefs(fresh.map(function (h) { return Object.assign({}, h); }), prev).concat(manual);
+    saveState();
+    return true;
+  }
+
+  function activityAsOf() {
+    var a = (STATE.hcps || []).find(function (h) { return h.act && h.act.asOf; });
+    return a ? a.act.asOf : null;
+  }
+
+  // Returns a short reason when it can't rebuild (or '' when it did)
+  window.ciqRebuildFromActivity = function (why) {
+    var asOf = activityAsOf();
+    if (!asOf) return 'no activity';
+    var q = _ciqQuarterOf(asOf), today = _ciqIso(new Date());
+    if (_ciqQuarterOf(today).start !== q.start) return 'activity is from another quarter';
+    if (why === 'open' && STATE.actPlannedAsOf === asOf) return 'already rebuilt';
+    if (!STATE.hcps || !STATE.hcps.length) return 'no doctors';
+    var home = (document.getElementById('cfg-home-address') || {}).value || STATE.config.homeAddress || '';
+    if (!/\b\d{5}\b/.test(home)) return 'no home ZIP';
+    var from = shift(asOf, 1);
+    while (from <= q.end && isBlocked(from)) from = shift(from, 1);
+    if (from > q.end) return 'quarter is over';
+    var d = new Date(from + 'T00:00:00'), start = shift(from, -((d.getDay() + 6) % 7));    // Monday of that week
+    if (start < q.start) { start = q.start; while (new Date(start + 'T00:00:00').getDay() !== 1) start = shift(start, 1); }
+    var sd = document.getElementById('plan-start-date'), ed = document.getElementById('plan-end-date'), pl = document.getElementById('plan-label');
+    if (!sd || typeof generateQuarter !== 'function') return 'planner not ready';
+    sd.value = start;
+    if (ed) { ed.value = q.end; ed.dataset.auto = '1'; }
+    if (pl) pl.value = 'Q' + q.q + ' ' + q.year;
+    window._ciqActSkipThrough = asOf;
+    try { generateQuarter(); } finally { window._ciqActSkipThrough = undefined; }
+    STATE.actPlannedAsOf = asOf;
+    STATE.actPlannedFrom = from;
+    saveState();
+    try { if (typeof renderActivityCard === 'function') renderActivityCard(); } catch (e) {}
+    if (typeof showToast === 'function') {
+      showToast('✓ Calls through ' + fmt(asOf) + ' — plan rebuilt from ' + fmt(from) + ' to ' + fmt(q.end));
+    }
+    return '';
+  };
+
+  // New activity from a file or a live pull → rebuild right away
+  var origApply = window.applyActivityRows;
+  if (typeof origApply === 'function' && !origApply._ciqAuto) {
+    window.applyActivityRows = function () {
+      var r = origApply.apply(this, arguments);
+      if (r && r.ok) setTimeout(function () { window.ciqRebuildFromActivity('import'); }, 50);
+      return r;
+    };
+    window.applyActivityRows._ciqAuto = true;
+  }
+
+  // On open: pick up what was published, then rebuild if the activity is newer than the plan
+  function onOpen() {
+    var refreshed = false;
+    try { refreshed = refreshFromPublished(); } catch (e) { console.warn('[ciq] refresh', e); }
+    if (refreshed) { try { renderHCPTable(); updateBadges(); } catch (e) {} }
+    try { if (isFieldBuild()) window.ciqRebuildFromActivity('open'); } catch (e) { console.warn('[ciq] rebuild', e); }
+  }
+  if (document.readyState === 'loading') document.addEventListener('DOMContentLoaded', function () { setTimeout(onOpen, 300); });
+  else setTimeout(onOpen, 300);
+})();
+</script>
 </body>
 </html>
