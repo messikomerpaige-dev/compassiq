@@ -213,6 +213,56 @@ test('a rep gets only their territory, and can build a plan', async () => {
   assert.deepEqual(page.errors, []);
 });
 
+test('new call activity rebuilds the rep’s plan from its “calls through” date', async () => {
+  // Owner republishes the same doctors with activity through Tue Oct 13: N…100–104 at goal (2 calls), N…105–109 seen once
+  const act = (done) => ({ q: '2026-Q4', asOf: '2026-10-13', last: '2026-10-12', byType: { 'In-person': done }, done });
+  const rows = [...Array.from({ length: 30 }, (_, i) => ({ ...hcp(String(1000000100 + i), 'North'), ...(i < 10 ? { act: act(i < 5 ? 2 : 1) } : {}) })),
+    ...Array.from({ length: 12 }, (_, i) => hcp(String(1000000200 + i), 'South', '19087'))];
+  const owner = await newPage();
+  await signIn(owner, 'owner@acme.test', 'owner-password-1', '/admin');
+  const published = await owner.evaluate(async (rows) => {
+    const post = (b) => fetch('/api/admin', { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify(b) }).then((r) => r.json());
+    const { publish_id } = await post({ action: 'publish_begin' });
+    await post({ action: 'publish_rows', publish_id, rows });
+    return post({ action: 'publish_finish', publish_id });
+  }, rows);
+  assert.equal(published.hcp_count, 42);
+
+  const rep = await newPage();
+  await rep.clock.install({ time: new Date('2026-10-14T09:00:00') });           // Wednesday
+  await signIn(rep, 'rep1@acme.test', 'rep1-password-1', '/app');
+  await rep.waitForFunction(() => document.getElementById('ob') && document.getElementById('ob').classList.contains('show'), null, { timeout: 60000 });
+  await rep.fill('#ob-zip', '19103');
+  await rep.click('#ob-go');
+  await rep.waitForFunction(() => STATE.hcps.length === 30);
+  // Reopen the app: it notices activity newer than the plan and rebuilds by itself
+  await rep.reload();
+  await rep.waitForFunction(() => STATE.actPlannedAsOf === '2026-10-13', null, { timeout: 60000 });
+  const r = await rep.evaluate(() => {
+    const by = {}; STATE.plan.forEach((v) => { if (!v.isLunch) by[v.npi] = (by[v.npi] || 0) + 1; });
+    return { start: STATE.planStartDate, from: STATE.actPlannedFrom, earliest: STATE.plan.map((v) => v.date).sort()[0],
+      atGoal: [0, 1, 2, 3, 4].map((i) => by[String(1000000100 + i)] || 0), seenOnce: by['1000000105'] || 0, notSeen: by['1000000120'] || 0,
+      toast: document.body.innerText.includes('plan rebuilt from Oct 14') };
+  });
+  assert.equal(r.start, '2026-10-12', 'week of the next working day');
+  assert.equal(r.from, '2026-10-14');
+  assert.ok(r.earliest >= '2026-10-14', 'nothing planned on days the activity covers: ' + r.earliest);
+  assert.deepEqual(r.atGoal, [0, 0, 0, 0, 0], 'doctors at goal get no more calls');
+  assert.ok(r.seenOnce >= 1 && r.notSeen >= r.seenOnce, JSON.stringify(r));
+  assert.ok(r.toast);
+  // Reopening again with the same activity does not rebuild
+  const planBefore = await rep.evaluate(() => JSON.stringify(STATE.plan.map((v) => v.date + v.npi)));
+  await rep.reload();
+  await rep.waitForFunction(() => typeof STATE !== 'undefined' && document.querySelector('.ciq-acct'), null, { timeout: 60000 });
+  await rep.waitForTimeout(800);
+  assert.equal(await rep.evaluate(() => JSON.stringify(STATE.plan.map((v) => v.date + v.npi))), planBefore);
+  // The rep loads newer activity from a file: rebuilt right away from the new date
+  await rep.evaluate(() => applyActivityRows([['NPI', 'Call_Date'], ['1000000120', '2026-10-14'], ['1000000121', '2026-10-15']], 'later.csv'));
+  await rep.waitForFunction(() => STATE.actPlannedAsOf === '2026-10-15', null, { timeout: 30000 });
+  assert.ok(await rep.evaluate(() => STATE.plan.every((v) => v.date >= '2026-10-16')));
+  assert.deepEqual(owner.errors.concat(rep.errors), []);
+});
+
 test('Build plan warns when a plan only covers the end of a quarter, and fixes it in one click', async () => {
   const page = await newPage();
   await signIn(page, 'rep1@acme.test', 'rep1-password-1', '/app');
