@@ -1,0 +1,16 @@
+{
+  "name": "CompassIQ",
+  "short_name": "CompassIQ",
+  "description": "Territory routing and call planning for field reps",
+  "start_url": "/app",
+  "scope": "/",
+  "display": "standalone",
+  "orientation": "any",
+  "background_color": "#1e2a4a",
+  "theme_color": "#1e2a4a",
+  "icons": [
+    { "src": "/icon.svg", "sizes": "any", "type": "image/svg+xml", "purpose": "any" },
+    { "src": "/apple-touch-icon.png", "sizes": "180x180", "type": "image/png" },
+    { "src": "/icon-512.png", "sizes": "512x512", "type": "image/png" }
+  ]
+}

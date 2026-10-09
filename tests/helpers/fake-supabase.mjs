@@ -12,7 +12,7 @@ const AUTH_STUB = `
   create function auth.uid() returns uuid language sql stable as
     $$ select nullif(current_setting('request.jwt.claims', true)::json->>'sub', '')::uuid $$;
   grant usage on schema auth to anon, authenticated;
-  grant usage on schema public to anon, authenticated;
+  grant usage on schema public to anon, authenticated, service_role;
   grant execute on function auth.uid() to anon, authenticated;
 `;
 const TABLE_FNS = new Set(['ciq_app_hcps']);
@@ -65,8 +65,8 @@ export async function createFakeSupabase() {
     });
     try {
       const rows = await db.transaction(async (tx) => {
-        await tx.query(`set local role ${userId ? 'authenticated' : 'anon'}`);
-        if (userId) await tx.query(`select set_config('request.jwt.claims', $1, true)`, [JSON.stringify({ sub: userId })]);
+        await tx.query(`set local role ${userId === 'service' ? 'service_role' : userId ? 'authenticated' : 'anon'}`);
+        if (userId && userId !== 'service') await tx.query(`select set_config('request.jwt.claims', $1, true)`, [JSON.stringify({ sub: userId })]);
         const sql = TABLE_FNS.has(fn) ? `select * from ${call}` : `select ${call} as v`;
         return (await tx.query(sql, params)).rows;
       });
@@ -82,7 +82,7 @@ export async function createFakeSupabase() {
     const token = auth.replace(/^Bearer /, '');
     const isService = key === 'service-key';
     return {
-      rpc: (fn, args) => runRpc(state.access.get(token) || null, fn, args),
+      rpc: (fn, args) => runRpc(isService ? 'service' : (state.access.get(token) || null), fn, args),
       auth: {
         async getUser(jwt) {
           const id = state.access.get(jwt);

@@ -5,7 +5,13 @@
 //   POST { action: 'publish_begin' }            → { publish_id }
 //   POST { action: 'publish_rows', publish_id, rows }   (≤ 1000 doctors per call)
 //   POST { action: 'publish_finish', publish_id }       → { hcp_count, territory_count }
+//   POST { action: 'activity_overview' }                → recent call-activity loads and warehouse keys
+//   POST { action: 'load_activity', calls, through? }   → upload calls (≤ 5000 per call)
+//   POST { action: 'create_key', label }                → { key } — shown once; only a hash is kept
+//   POST { action: 'revoke_key', id }
+import { createHash, randomBytes } from 'node:crypto';
 import { handler, requireAccess, rpc, body, httpError, inviteLogin, EMAIL_RE } from './_lib/ciq.js';
+import { normalizeCalls, normDate } from './_lib/activity.js';
 
 const ROLES = ['owner', 'admin', 'manager', 'rep'];
 const uuids = (v) => (Array.isArray(v) ? v.map(String) : null);
@@ -64,6 +70,27 @@ export default handler(async (req, res) => {
     }
     case 'publish_finish':
       return res.status(200).json(await rpc(db, 'ciq_publish_finish', { p_publish: String(b.publish_id || '') }));
+    case 'activity_overview':
+      return res.status(200).json(await rpc(db, 'ciq_admin_activity_overview'));
+    case 'load_activity': {
+      const { calls, skipped } = normalizeCalls(b.calls);
+      if (calls.length > 5000) throw httpError(400, 'Send up to 5000 calls at a time');
+      if (!calls.length) throw httpError(400, 'No calls with an NPI and a readable date');
+      const r = await rpc(db, 'ciq_admin_load_activity', { p_through: normDate(b.through) || null, p_rows: calls });
+      return res.status(200).json({ ...r, skipped });
+    }
+    case 'create_key': {
+      const key = 'ciq_live_' + randomBytes(24).toString('base64url');
+      const id = await rpc(db, 'ciq_admin_create_key', {
+        p_label: String(b.label || 'Data warehouse').slice(0, 80),
+        p_hash: createHash('sha256').update(key).digest('hex'),
+        p_hint: 'ciq_live_…' + key.slice(-4),
+      });
+      return res.status(200).json({ id, key });
+    }
+    case 'revoke_key':
+      await rpc(db, 'ciq_admin_revoke_key', { p_id: String(b.id || '') });
+      return res.status(200).json({ ok: true });
     default:
       throw httpError(400, 'Unknown action');
   }

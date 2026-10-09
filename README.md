@@ -40,7 +40,41 @@ How it works:
 - **Moving territory:** when an admin moves a rep to another territory, the app opens "Change
   territory" with the new one picked. Their hours, home ZIP and time off stay the same.
 
-**Not yet:** offline mode and the live call-activity pull (`/api/activity`).
+## Call activity feed, team view and offline mode (Phase 3)
+
+**Call activity in the cloud.** Completed calls are stored per company (`call_activity`, one call per
+doctor per day) and come in two ways:
+- **From the data warehouse:** an owner or admin selects **Connect data warehouse** on Team &
+  territories to create a key. The warehouse posts calls to `/api/activity` with that key (see
+  [the format below](#data-warehouse-feed)). Keys are stored only as hashes, can be revoked, and stop
+  working when the company is suspended.
+- **Upload:** **Upload calls** on Team & territories takes the same columns from Excel or CSV.
+
+Each rep's app pulls its doctors' calls when it opens (and right after first-time setup). When
+something changed, it applies them and rebuilds the rest of the quarter from the "calls through"
+date. Visits marked done in the app count as calls too (from before today).
+
+**Team view (`/team`).** For owners, admins and managers, covering the reps in their territories:
+- calls vs. quarterly goal, with a marker for where the rep should be today;
+- doctors reached, and missed visits;
+- when the plan last synced.
+
+Selecting a rep shows their week's visits (with done/missed), the doctors not reached yet, and the
+missed visits with reasons. Managers reach it from the account box in the app; admins also from the
+top bar.
+
+**Offline mode.** A service worker (`public/sw.js`, scoped to `/app`) keeps the app and the
+person's doctors on the iPad, so CompassIQ opens without a connection:
+- Visit outcomes, preferences and plan changes made offline are kept and sent when the connection
+  returns. A banner shows while offline.
+- The offline copy is refused after 7 days without an online open, since access may have been
+  turned off in the meantime.
+- It is erased on sign-out, when the server reports the person signed out or turned off, and on
+  the blocked page.
+- Sign-in, admin and team pages are never cached.
+- Map tiles and road drive times need a connection.
+
+The app can be added to the home screen (`manifest.webmanifest`, icons in `public/`).
 
 ## Tests
 
@@ -93,19 +127,48 @@ When a plan starts in the same quarter as the activity:
 
 Activity is stored on each HCP record (`h.act`), the same way trends are, so it carries through publishing to reps.
 
-### Live pull API (for the cloud backend)
+### Data warehouse feed
 
-The **Pull from data warehouse** button only appears when the app is opened from a web address. It calls:
+The warehouse sends completed calls with the company's key. CSV:
 
 ```
-GET /api/activity?from=YYYY-MM-DD[&territory=<territory name>]     (same-origin cookie auth)
-→ 200 { "asOf": "YYYY-MM-DD", "calls": [ { "npi": "...", "date": "YYYY-MM-DD", "type": "...", "status": "..." } ] }
+POST /api/activity?through=2026-10-13
+Authorization: Bearer ciq_live_…
+Content-Type: text/csv
+
+NPI,Call_Date,Call_Type,Status
+1234567890,2026-10-13,In-person,Submitted
 ```
 
-Field builds send their territory; the admin build pulls all territories. The server must
-only return calls for territories the signed-in user may see. If the server returns 404, the
-app tells the user live sync isn't set up and to load a file instead. If it returns 401 or 403,
-the app asks them to sign in.
+or JSON:
+
+```
+POST /api/activity
+Authorization: Bearer ciq_live_…
+Content-Type: application/json
+
+{ "through": "2026-10-13", "calls": [ { "npi": "1234567890", "date": "2026-10-13", "type": "In-person" } ] }
+```
+
+Response: `{ "rows": <calls stored>, "through": "YYYY-MM-DD", "skipped": <rows without an NPI or readable date> }`.
+
+How the server handles a load:
+- It uses the same columns and status rules as the file format above.
+- `through` is the date the load covers. Without it, the latest call date in the load is used.
+- Sending the same calls again is harmless, so a nightly job can resend the whole quarter.
+- An invalid or revoked key gets `401`.
+
+### Live pull API
+
+The app (and its **Pull from data warehouse** button) reads calls back with:
+
+```
+GET /api/activity?from=YYYY-MM-DD     (signed-in cookie session)
+→ 200 { "asOf": "YYYY-MM-DD", "through": "YYYY-MM-DD", "calls": [ { "npi": "...", "date": "YYYY-MM-DD", "type": "...", "status": "..." } ] }
+```
+
+It only returns calls for doctors in territories the signed-in person may see. `asOf` is the
+later of the latest load's "through" date and the newest call.
 
 ## Road drive times for stop order (v4.6)
 

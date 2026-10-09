@@ -15,6 +15,7 @@
   </div>
   <div class="who">
     <a href="/app">Open CompassIQ</a>
+    <a href="/team">Team view</a>
     <a href="/admin/tool">Load &amp; publish doctor data</a>
     <span id="me"></span>
     <button class="btn secondary sm" id="signout" type="button">Sign out</button>
@@ -51,6 +52,55 @@
     </table></div>
   </section>
 </main>
+
+<main class="wrap" style="padding-top:0;">
+  <section class="panel" id="activity-panel">
+    <div class="panel-head">
+      <h2>Call activity</h2>
+      <div class="row-actions">
+        <label class="btn secondary sm" for="act-file" style="margin:0;">Upload calls (Excel or CSV)…</label>
+        <input type="file" id="act-file" accept=".xlsx,.xls,.csv" hidden>
+        <button class="btn sm" id="key-new" type="button">Connect data warehouse</button>
+      </div>
+    </div>
+    <p class="muted small">Completed calls (NPI, call date, optional call type and status). Reps’ apps pick them up when they open and
+      rebuild the rest of the quarter from the “calls through” date. Visits reps mark done in the app count too.</p>
+    <div class="msg" id="act-msg" role="alert"></div>
+    <div class="stats" id="act-stats" style="margin:12px 0;"></div>
+    <div class="table-wrap"><table>
+      <thead><tr><th>Loaded</th><th>Calls through</th><th>Calls</th><th>From</th></tr></thead>
+      <tbody id="act-loads"></tbody>
+    </table></div>
+    <h3 style="margin-top:18px;">Data warehouse keys</h3>
+    <p class="muted small">Your data warehouse sends calls to <code id="act-endpoint"></code> with one of these keys. Revoke a key to cut it off.</p>
+    <div class="table-wrap"><table>
+      <thead><tr><th>Name</th><th>Key</th><th>Created</th><th>Last used</th><th></th></tr></thead>
+      <tbody id="act-keys"></tbody>
+    </table></div>
+  </section>
+</main>
+
+<dialog id="key-dlg">
+  <form id="key-form" novalidate>
+    <h2 id="key-title">Connect your data warehouse</h2>
+    <div id="key-step1">
+      <p class="muted small">Creates a secret key your data warehouse uses to send completed calls to CompassIQ.</p>
+      <label for="key-label">Name</label>
+      <input type="text" id="key-label" value="Data warehouse nightly load" autocomplete="off">
+    </div>
+    <div id="key-step2" hidden>
+      <p class="small"><b>Copy this key now — it won’t be shown again.</b> Give it to whoever runs your data warehouse.</p>
+      <input type="text" id="key-value" readonly style="font-family:monospace;font-size:13px;">
+      <p class="muted small" style="margin-top:12px;">They send calls with:</p>
+      <pre id="key-howto" style="white-space:pre-wrap;font-size:12px;background:var(--surface-2);border:1px solid var(--border);border-radius:8px;padding:10px;"></pre>
+    </div>
+    <div class="msg" id="key-msg" role="alert"></div>
+    <div class="dialog-actions">
+      <button class="btn secondary" type="button" id="key-close">Close</button>
+      <button class="btn" type="submit" id="key-go">Create key</button>
+    </div>
+  </form>
+</dialog>
 
 <dialog id="person-dlg">
   <form id="person-form" method="dialog" novalidate>
@@ -124,6 +174,7 @@
       $('me').textContent = me.email;
       state = await api('/api/admin');
       render();
+      loadActivity();
     } catch (e) {
       if (e.status === 401) return location.replace('/?next=/admin');
       showMsg($('page-msg'), e.message);
@@ -241,6 +292,68 @@
       showMsg($('page-msg'), err.message);
     }
   }
+
+  // ── Call activity ─────────────────────────────────────────────────────
+  async function loadActivity() {
+    try { renderActivity(await api('/api/admin', { method: 'POST', body: { action: 'activity_overview' } })); }
+    catch (e) { showMsg($('act-msg'), e.message); }
+  }
+  function renderActivity(a) {
+    const last = a.loads[0];
+    $('act-endpoint').textContent = location.origin + '/api/activity';
+    $('act-stats').replaceChildren(...[[last ? last.through : '—', 'calls through'],
+      [a.calls.toLocaleString(), 'calls stored'], [String(a.keys.length), 'active keys']]
+      .map(([n, l]) => h('div', { class: 'stat' }, h('b', {}, n), h('span', {}, l))));
+    $('act-loads').replaceChildren(...(a.loads.length ? a.loads.map((l) => h('tr', {},
+      h('td', { class: 'small' }, fmtDate(l.at)), h('td', {}, l.through), h('td', { class: 'num' }, l.rows.toLocaleString()),
+      h('td', { class: 'small' }, l.source === 'upload' ? 'Upload' : 'Data warehouse')))
+      : [h('tr', {}, h('td', { colspan: 4, class: 'empty' }, 'No calls loaded yet.'))]));
+    $('act-keys').replaceChildren(...(a.keys.length ? a.keys.map((k) => h('tr', {},
+      h('td', {}, k.label), h('td', { class: 'small' }, h('code', {}, k.hint)), h('td', { class: 'small' }, fmtDate(k.created_at)),
+      h('td', { class: 'small' }, k.last_used_at ? fmtDate(k.last_used_at) : 'Never'),
+      h('td', {}, h('button', { class: 'btn danger sm', type: 'button', onclick: async () => {
+        if (!confirm('Revoke “' + k.label + '”? Loads using it will stop working.')) return;
+        try { await api('/api/admin', { method: 'POST', body: { action: 'revoke_key', id: k.id } }); loadActivity(); }
+        catch (e) { showMsg($('act-msg'), e.message); }
+      } }, 'Revoke'))))
+      : [h('tr', {}, h('td', { colspan: 5, class: 'empty' }, 'No keys yet — select “Connect data warehouse”.'))]));
+  }
+  $('act-file').addEventListener('change', async () => {
+    const f = $('act-file').files[0]; if (!f) return;
+    showMsg($('act-msg'), 'Reading ' + f.name + '…', 'ok');
+    try {
+      const XLSX = await loadXlsx();
+      const wb = XLSX.read(new Uint8Array(await f.arrayBuffer()), { type: 'array' });
+      const rows = XLSX.utils.sheet_to_json(wb.Sheets[wb.SheetNames[0]], { defval: '', raw: false });
+      if (!rows.length) throw new Error('The sheet is empty');
+      let total = 0, through = '', skipped = 0;
+      for (let i = 0; i < rows.length; i += 4000) {
+        const r = await api('/api/admin', { method: 'POST', body: { action: 'load_activity', calls: rows.slice(i, i + 4000) } });
+        total += r.rows; skipped += r.skipped || 0; through = r.through;
+      }
+      showMsg($('act-msg'), total.toLocaleString() + ' calls loaded, through ' + through + (skipped ? ' · ' + skipped + ' rows skipped (no NPI or date)' : '')
+        + '. Reps get them the next time they open CompassIQ.', 'ok');
+    } catch (e) { showMsg($('act-msg'), e.message); }
+    $('act-file').value = '';
+    loadActivity();
+  });
+  $('key-new').addEventListener('click', () => {
+    $('key-step1').hidden = false; $('key-step2').hidden = true; $('key-go').hidden = false; showMsg($('key-msg'), '');
+    $('key-dlg').showModal();
+  });
+  $('key-close').addEventListener('click', () => { $('key-dlg').close(); loadActivity(); });
+  $('key-form').addEventListener('submit', async (e) => {
+    e.preventDefault();
+    try {
+      const r = await api('/api/admin', { method: 'POST', body: { action: 'create_key', label: $('key-label').value } });
+      $('key-value').value = r.key;
+      $('key-howto').textContent = 'POST ' + location.origin + '/api/activity\nAuthorization: Bearer ' + r.key
+        + '\nContent-Type: text/csv\n\nNPI,Call_Date,Call_Type,Status\n1234567890,2026-10-13,In-person,Submitted\n…'
+        + '\n\n(or JSON: {"through":"2026-10-13","calls":[{"npi":"1234567890","date":"2026-10-13"}]})';
+      $('key-step1').hidden = true; $('key-step2').hidden = false; $('key-go').hidden = true;
+      $('key-value').select();
+    } catch (err) { showMsg($('key-msg'), err.message); }
+  });
 
   // ── Import from a sheet ────────────────────────────────────────────────
   let plan = [], sending = false;
