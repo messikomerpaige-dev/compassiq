@@ -38,7 +38,7 @@
       ]
     },
     {
-      "source": "/(app|admin|admin/tool|platform)",
+      "source": "/(app|admin|admin/tool|platform|team|sw.js)",
       "headers": [
         {
           "key": "Cache-Control",

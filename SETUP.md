@@ -78,7 +78,19 @@ get preview addresses for testing.
    - **Invite someone** adds reps (one territory each), managers (the territories you pick) and
      admins.
 3. Reps open the invite email, set a password, and sign in on their iPad. In Safari, use
-   **Share → Add to Home Screen** for an app icon.
+   **Share → Add to Home Screen** for an app icon. After the first open, the app also works
+   offline for up to 7 days at a time.
+
+## Call activity from the data warehouse
+
+On **Team & territories → Call activity**:
+- **Connect data warehouse** creates a key, shown once. Give the key, and the instructions shown
+  with it, to whoever runs the warehouse's nightly export.
+- **Upload calls** is the manual option: an Excel or CSV file with `NPI` and `Call_Date` columns,
+  plus optional `Call_Type` and `Status`.
+
+Reps' apps pick up new calls the next time they open, and rebuild the rest of the quarter.
+Managers and admins can follow progress on **Team view** (`/team`).
 
 ## Turning access off
 

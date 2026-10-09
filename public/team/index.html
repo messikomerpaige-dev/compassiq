@@ -1,0 +1,201 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Team view · CompassIQ</title>
+<link rel="stylesheet" href="/assets/ciq.css">
+<style>
+  .bar { height: 8px; border-radius: 999px; background: var(--surface-2); border: 1px solid var(--border); overflow: hidden; margin-top: 5px; min-width: 110px; position: relative; }
+  .bar i { display: block; height: 100%; background: var(--accent); }
+  .bar b { position: absolute; top: -2px; bottom: -2px; width: 2px; background: var(--text-3); }
+  .pace { font-size: 12px; font-weight: 600; }
+  .pace.ahead { color: var(--ok); } .pace.behind { color: var(--warn); }
+  tr.rep { cursor: pointer; }
+  tr.rep:hover td, tr.rep.sel td { background: var(--accent-soft); }
+  .weeknav { display: flex; align-items: center; gap: 6px; flex-wrap: wrap; }
+  .days { display: grid; grid-template-columns: repeat(auto-fit, minmax(190px, 1fr)); gap: 10px; }
+  .day { background: var(--surface-2); border: 1px solid var(--border); border-radius: 10px; padding: 10px 12px; }
+  .day h3 { font-size: 13px; margin-bottom: 6px; }
+  .visit { display: flex; gap: 8px; align-items: baseline; font-size: 13px; padding: 3px 0; }
+  .visit .t { color: var(--text-3); font-variant-numeric: tabular-nums; min-width: 62px; }
+  .visit .n { flex: 1; }
+  .pill.warn { background: var(--warn-soft); color: var(--warn); border-color: transparent; }
+  .cols { display: grid; grid-template-columns: repeat(auto-fit, minmax(300px, 1fr)); gap: 18px; margin-top: 18px; }
+  ul.plain { list-style: none; padding: 0; margin: 0; font-size: 14px; }
+  ul.plain li { padding: 6px 0; border-bottom: 1px solid var(--border); }
+</style>
+</head>
+<body>
+<header class="topbar">
+  <div class="brand">
+    <svg width="24" height="24" viewBox="0 0 56 56" fill="none" aria-hidden="true"><circle cx="28" cy="28" r="22" stroke="currentColor" stroke-width="2.6"/><path d="M28 10 L34 28 L28 25 L22 28 Z" fill="#7c5cff"/><path d="M28 46 L34 28 L28 31 L22 28 Z" fill="currentColor" opacity=".35"/></svg>
+    <span>Compass<em>IQ</em></span>
+    <span class="muted" style="font-weight:400;font-size:14px;" id="org-name"></span>
+  </div>
+  <div class="who">
+    <a href="/app">Open CompassIQ</a>
+    <a href="/admin" id="admin-link" hidden>Team &amp; data</a>
+    <span id="me"></span>
+    <button class="btn secondary sm" id="signout" type="button">Sign out</button>
+  </div>
+</header>
+
+<main class="wrap">
+  <div class="msg" id="page-msg" role="alert"></div>
+
+  <section class="panel">
+    <div class="panel-head"><h2>Quarter to date</h2><span class="muted small" id="q-label"></span></div>
+    <div class="stats" id="stats"></div>
+  </section>
+
+  <section class="panel">
+    <div class="panel-head">
+      <h2>Reps</h2>
+      <div class="weeknav">
+        <button class="btn secondary sm" type="button" id="wk-prev" aria-label="Previous week">‹</button>
+        <span class="small" id="wk-label"></span>
+        <button class="btn secondary sm" type="button" id="wk-next" aria-label="Next week">›</button>
+        <button class="btn secondary sm" type="button" id="wk-this">This week</button>
+      </div>
+    </div>
+    <div class="table-wrap"><table>
+      <thead><tr><th>Rep</th><th>Calls vs goal</th><th>Doctors reached</th><th>Missed</th><th>Visits this week</th><th>Plan last synced</th></tr></thead>
+      <tbody id="reps"></tbody>
+    </table></div>
+    <p class="muted small" style="margin-top:10px;">Calls come from your data warehouse or uploads, plus visits reps mark done in the app.
+      Goal is each doctor’s yearly call goal ÷ 4. The tick on each bar is where the rep should be today.</p>
+  </section>
+
+  <section class="panel" id="detail" hidden>
+    <div class="panel-head"><h2 id="d-name"></h2><span class="muted small" id="d-sub"></span></div>
+    <div class="days" id="d-week"></div>
+    <div class="cols">
+      <div><h3>Not reached yet this quarter</h3><ul class="plain" id="d-unreached"></ul></div>
+      <div><h3>Missed visits</h3><ul class="plain" id="d-missed"></ul></div>
+    </div>
+  </section>
+</main>
+
+<script src="/assets/ciq-page.js"></script>
+<script>
+(function () {
+  'use strict';
+  const { api, h, showMsg, signOut, fmtDate } = window.CIQ;
+  const $ = (id) => document.getElementById(id);
+  let data = null, selected = null, week = null;
+
+  $('signout').addEventListener('click', signOut);
+
+  const DAY = 864e5;
+  const parse = (iso) => new Date(iso + 'T00:00:00');
+  const isoOf = (d) => d.getFullYear() + '-' + String(d.getMonth() + 1).padStart(2, '0') + '-' + String(d.getDate()).padStart(2, '0');
+  const shortDate = (iso, opts) => parse(iso).toLocaleDateString('en-US', opts || { month: 'short', day: 'numeric' });
+  const pct = (a, b) => (b ? Math.round((100 * a) / b) : 0);
+
+  // Share of the quarter's working days (Mon–Fri) already behind us
+  function elapsedShare(q) {
+    const start = parse(q.start), end = parse(q.end), today = parse(isoOf(new Date()));
+    let all = 0, past = 0;
+    for (let d = new Date(start); d <= end; d = new Date(d.getTime() + DAY)) {
+      if (d.getDay() === 0 || d.getDay() === 6) continue;
+      all++; if (d < today) past++;
+    }
+    return all ? past / all : 0;
+  }
+
+  async function load() {
+    try {
+      const me = await api('/api/session');
+      if (!me.access.active) return location.replace('/blocked');
+      if (!['owner', 'admin', 'manager'].includes(me.access.member.role)) return location.replace('/app');
+      $('me').textContent = me.email;
+      $('admin-link').hidden = !['owner', 'admin'].includes(me.access.member.role);
+      await loadWeek(new URLSearchParams(location.search).get('week') || '');
+    } catch (e) {
+      if (e.status === 401) return location.replace('/?next=/team');
+      showMsg($('page-msg'), e.message);
+    }
+  }
+
+  async function loadWeek(w) {
+    data = await api('/api/team' + (w ? '?week=' + encodeURIComponent(w) : ''));
+    week = data.weekStart;
+    $('org-name').textContent = data.org ? '· ' + data.org : '';
+    render();
+  }
+
+  function render() {
+    const q = data.quarter, share = elapsedShare(q), reps = data.reps;
+    $('q-label').textContent = shortDate(q.start) + ' – ' + shortDate(q.end, { month: 'short', day: 'numeric', year: 'numeric' })
+      + ' · ' + Math.round(share * 100) + '% of working days done';
+    const sum = (k) => reps.reduce((s, r) => s + (r[k] || 0), 0);
+    const doctors = sum('doctors');
+    $('stats').replaceChildren(...[
+      [String(reps.length), 'reps'],
+      [pct(sum('done'), sum('goal')) + '%', sum('done').toLocaleString() + ' of ' + sum('goal').toLocaleString() + ' goal calls'],
+      [pct(sum('reached'), doctors) + '%', sum('reached').toLocaleString() + ' of ' + doctors.toLocaleString() + ' doctors reached'],
+      [String(sum('missed')), 'missed visits'],
+    ].map(([n, l]) => h('div', { class: 'stat' }, h('b', {}, n), h('span', {}, l))));
+
+    const end = new Date(parse(week).getTime() + 6 * DAY);
+    $('wk-label').textContent = 'Week of ' + shortDate(week) + ' – ' + shortDate(isoOf(end));
+
+    $('reps').replaceChildren(...(reps.length ? reps.map((r) => {
+      const expected = r.goal * share, ahead = r.done >= expected - 0.5;
+      const visits = r.week.filter((v) => !v.meal);
+      const doneWk = visits.filter((v) => v.outcome === 'done').length, missedWk = visits.filter((v) => v.outcome === 'missed').length;
+      const row = h('tr', { class: 'rep' + (selected === r.user_id ? ' sel' : ''), tabindex: '0', onclick: () => pick(r.user_id),
+        onkeydown: (e) => { if (e.key === 'Enter' || e.key === ' ') { e.preventDefault(); pick(r.user_id); } } },
+        h('td', {}, h('div', {}, r.name || r.email), h('div', { class: 'muted small' }, r.territories.join(', ') || 'No territory'),
+          r.status !== 'active' ? h('span', { class: 'pill off' }, 'Turned off') : null),
+        h('td', {}, h('div', { class: 'small' }, r.done + ' / ' + r.goal + ' ',
+            r.goal ? h('span', { class: 'pace ' + (ahead ? 'ahead' : 'behind') }, ahead ? 'on pace' : Math.ceil(expected - r.done) + ' behind') : null),
+          h('div', { class: 'bar' }, h('i', { style: 'width:' + Math.min(100, pct(r.done, r.goal)) + '%' }), h('b', { style: 'left:' + Math.round(share * 100) + '%' }))),
+        h('td', { class: 'num' }, r.reached + ' / ' + r.doctors, h('div', { class: 'muted small' }, pct(r.reached, r.doctors) + '%')),
+        h('td', { class: 'num' }, String(r.missed)),
+        h('td', { class: 'num' }, visits.length ? String(visits.length) : h('span', { class: 'muted' }, '—'),
+          doneWk || missedWk ? h('div', { class: 'muted small' }, [doneWk && doneWk + ' done', missedWk && missedWk + ' missed'].filter(Boolean).join(' · ')) : null),
+        h('td', { class: 'small' }, r.plan_saved_at ? fmtDate(r.plan_saved_at) : h('span', { class: 'muted' }, 'No plan yet')));
+      return row;
+    }) : [h('tr', {}, h('td', { colspan: 6, class: 'empty' }, 'No reps in your territories yet.'))]));
+    renderDetail();
+  }
+
+  function pick(id) { selected = selected === id ? null : id; render(); if (selected) $('detail').scrollIntoView({ behavior: 'smooth', block: 'start' }); }
+
+  function renderDetail() {
+    const r = data.reps.find((x) => x.user_id === selected);
+    $('detail').hidden = !r;
+    if (!r) return;
+    $('d-name').textContent = r.name || r.email;
+    $('d-sub').textContent = r.territories.join(', ') + ' · ' + r.plan_calls + ' visits planned this quarter';
+    const byDay = {};
+    r.week.forEach((v) => { (byDay[v.date] = byDay[v.date] || []).push(v); });
+    const days = Object.keys(byDay).sort();
+    const OUT = { done: ['ok', 'Done'], missed: ['off', 'Missed'] };
+    $('d-week').replaceChildren(...(days.length ? days.map((d) => h('div', { class: 'day' },
+      h('h3', {}, shortDate(d, { weekday: 'long', month: 'short', day: 'numeric' })),
+      byDay[d].map((v) => h('div', { class: 'visit' }, h('span', { class: 't' }, v.time || ''),
+        h('span', { class: 'n' }, v.meal ? 'Lunch' : (v.name || v.npi), v.city ? h('span', { class: 'muted' }, ' · ' + v.city) : null),
+        OUT[v.outcome] ? h('span', { class: 'pill ' + OUT[v.outcome][0] }, OUT[v.outcome][1]) : null))))
+      : [h('p', { class: 'empty' }, r.plan_saved_at ? 'Nothing planned this week.' : 'This rep hasn’t built a plan yet.')]));
+    $('d-unreached').replaceChildren(...(r.unreached.length ? r.unreached.map((u) => h('li', {},
+      u.name || u.npi, ' ', u.segment ? h('span', { class: 'pill warn' }, u.segment) : null, u.city ? h('span', { class: 'muted small' }, ' ' + u.city) : null))
+      .concat(r.doctors - r.reached > r.unreached.length ? [h('li', { class: 'muted small' }, '… and ' + (r.doctors - r.reached - r.unreached.length) + ' more')] : [])
+      : [h('li', { class: 'empty' }, 'Every doctor has been reached.')]));
+    $('d-missed').replaceChildren(...(r.missed_list.length ? r.missed_list.map((m) => h('li', {},
+      h('b', {}, shortDate(m.date)), ' ', m.name || m.npi, m.reason ? h('div', { class: 'muted small' }, m.reason) : null))
+      : [h('li', { class: 'empty' }, 'No missed visits this quarter.')]));
+  }
+
+  const shift = (n) => loadWeek(isoOf(new Date(parse(week).getTime() + n * 7 * DAY))).catch((e) => showMsg($('page-msg'), e.message));
+  $('wk-prev').addEventListener('click', () => shift(-1));
+  $('wk-next').addEventListener('click', () => shift(1));
+  $('wk-this').addEventListener('click', () => loadWeek('').catch((e) => showMsg($('page-msg'), e.message)));
+
+  load();
+})();
+</script>
+</body>
+</html>

@@ -369,6 +369,111 @@ test('Phase 2: a rep’s edits are shared, and their plan follows them to a new 
   assert.deepEqual(ipad1.errors.concat(mgr.errors, ipad2.errors, owner.errors), []);
 });
 
+test('the data warehouse sends calls with a company key; the rep’s app picks them up and rebuilds its plan', async () => {
+  const owner = await newPage();
+  await signIn(owner, 'owner@acme.test', 'owner-password-1', '/admin');
+  await owner.click('#key-new');
+  await owner.click('#key-go');
+  await owner.waitForSelector('#key-step2:not([hidden])');
+  const key = await owner.inputValue('#key-value');
+  assert.match(key, /^ciq_live_/);
+  assert.match(await owner.textContent('#key-howto'), /POST http:\/\/127\.0\.0\.1:\d+\/api\/activity/);
+  await owner.click('#key-close');
+  await owner.waitForSelector('#act-keys tr:has-text("Data warehouse nightly load")');
+
+  // What a nightly job would send (outside any browser)
+  const send = (body, auth = key) => fetch(base + '/api/activity?through=2026-10-14', { method: 'POST',
+    headers: { authorization: 'Bearer ' + auth, 'content-type': 'text/csv' }, body }).then(async (r) => [r.status, await r.json()]);
+  assert.deepEqual(await send('NPI,Call_Date,Call_Type,Status\n1000000200,2026-10-13,In-person,Submitted\n1000000201,10/14/2026,Virtual,Completed\n1000000202,2026-10-14,In-person,Planned\n'),
+    [200, { rows: 2, through: '2026-10-14', skipped: 0 }]);
+  assert.equal((await send('NPI,Call_Date\n1000000203,2026-10-14\n', 'ciq_live_not-a-real-key'))[0], 401);
+  await owner.reload();
+  await owner.waitForSelector('#act-loads tr:has-text("2026-10-14")');
+  assert.match(await owner.textContent('#act-stats'), /2026-10-14/);
+
+  // Sam sets up the app on Thursday: the calls arrive by themselves and the plan starts after them
+  const rep = await newPage();
+  await rep.clock.install({ time: new Date('2026-10-15T09:00:00') });
+  await signIn(rep, 'rep2@acme.test', 'rep2-password-1', '/app');
+  await rep.waitForFunction(() => document.getElementById('ob') && document.getElementById('ob').classList.contains('show'), null, { timeout: 60000 });
+  await rep.fill('#ob-zip', '19087');
+  await rep.click('#ob-go');
+  await rep.waitForFunction(() => STATE.hcps.length === 12 && STATE.actPlannedAsOf === '2026-10-14', null, { timeout: 60000 });
+  const r = await rep.evaluate(() => ({ sig: STATE.actLiveSig, earliest: STATE.plan.map((v) => v.date).sort()[0],
+    seen: ['1000000200', '1000000201', '1000000202'].map((n) => (STATE.hcps.find((h) => h.npi === n).act || {}).done || 0) }));
+  assert.equal(r.sig, '2026-10-14|2');
+  assert.ok(r.earliest >= '2026-10-15', r.earliest);
+  assert.deepEqual(r.seen, [1, 1, 0], 'a "Planned" row is not a call');
+  await rep.evaluate(() => CIQState.upload());
+  await rep.waitForFunction(() => localStorage.getItem('ciq_state_at'), null, { timeout: 30000 });
+  ids.repPage = rep;
+  assert.deepEqual(owner.errors.concat(rep.errors), []);
+});
+
+test('managers get a team view of their reps; reps do not', async () => {
+  const mgr = await newPage();
+  await signIn(mgr, 'mgr@acme.test', 'mgr-password-1', '/app');
+  await mgr.waitForSelector('.ciq-acct a[href="/team"]', { timeout: 60000 });
+  await mgr.goto(base + '/team?week=2026-10-15');
+  await mgr.waitForSelector('#reps tr.rep');
+  assert.equal(await mgr.textContent('#wk-label'), 'Week of Oct 12 – Oct 18');
+  const rows = await mgr.$$eval('#reps tr.rep', (trs) => trs.map((tr) => tr.innerText.replace(/\s+/g, ' ')));
+  assert.deepEqual(rows.map((t) => t.split(' ').slice(0, 2).join(' ')), ['New One', 'New Two', 'Rita Rep', 'Sam Rep'], rows.join('\n'));   // New … from the sheet import
+  const sam = rows.find((t) => t.startsWith('Sam Rep'));
+  assert.match(sam, /South 2 \/ 24/, sam);                  // 12 doctors × 2 calls this quarter; 2 calls so far
+  assert.match(sam, /2 \/ 12 17%/);                         // doctors reached
+  await mgr.click('#reps tr.rep:has-text("Sam Rep")');
+  await mgr.waitForSelector('#detail:not([hidden]) .day');
+  const detail = await mgr.textContent('#detail');
+  assert.match(detail, /Thursday, Oct 15/);
+  assert.match(detail, /Not reached yet this quarter/);
+  assert.equal(await mgr.$$eval('#d-unreached li', (l) => l.length), 10);
+  // Next week, and back
+  await mgr.click('#wk-next');
+  await mgr.waitForFunction(() => document.getElementById('wk-label').textContent === 'Week of Oct 19 – Oct 25');
+
+  const rep = await newPage();
+  await signIn(rep, 'rep1@acme.test', 'rep1-password-1', '/app');
+  await rep.waitForSelector('.ciq-acct', { timeout: 60000 });
+  assert.equal(await rep.$('.ciq-acct a[href="/team"]'), null);
+  assert.equal(await rep.evaluate(() => fetch('/api/team').then((r) => r.status)), 403);
+  await rep.goto(base + '/team');
+  await rep.waitForURL(base + '/app', { timeout: 30000 });
+  assert.deepEqual(mgr.errors, []);
+});
+
+test('offline: the app opens without a connection, keeps working, and syncs when back online', async () => {
+  const rep = ids.repPage;                               // Sam's iPad from the warehouse test
+  const cached = () => rep.evaluate(async () => !!(await (await caches.open('ciq-data')).match('/api/app-data?page=0')) && !!(await (await caches.open(
+    (await caches.keys()).find((k) => k.startsWith('ciq-shell-')) || 'none')).match('/app')));
+  for (let i = 0; i < 60 && !(await cached()); i++) await rep.waitForTimeout(500);
+  assert.ok(await cached(), 'app and doctors kept for offline use');
+  const before = await rep.evaluate(() => STATE.plan.length);
+
+  await rep.context().setOffline(true);
+  await rep.reload();
+  await rep.waitForFunction(() => typeof STATE !== 'undefined' && document.querySelector('.ciq-acct'), null, { timeout: 60000 });
+  const r = await rep.evaluate(() => ({ hcps: ALL_HCPS.length, plan: STATE.plan.length, who: window.__CIQ_CLOUD.email,
+    banner: getComputedStyle(document.querySelector('.ciq-offline')).display }));
+  assert.deepEqual(r, { hcps: 12, plan: before, who: 'rep2@acme.test', banner: 'block' });
+  // Log a visit while offline: it waits on the device, and is sent when the connection is back
+  const npi = await rep.evaluate(() => { const v = STATE.plan.find((x) => !x.isLunch && x.npi); setOutcome(v, 'done', ''); return v.npi; });
+  const saved = async () => (await fake.db.query(`select count(*)::int n from public.visit_outcomes where user_id = $1 and npi = $2 and status = 'done'`,
+    [ids['rep2@acme.test'], npi])).rows[0].n;
+  await rep.waitForTimeout(1500);
+  assert.equal(await saved(), 0);
+  await rep.context().setOffline(false);
+  for (let i = 0; i < 60 && !(await saved()); i++) await rep.waitForTimeout(500);
+  assert.equal(await saved(), 1, 'sent after reconnecting');
+  assert.equal(await rep.evaluate(() => getComputedStyle(document.querySelector('.ciq-offline')).display), 'none');
+
+  // Signing out removes the offline copy
+  await rep.click('.ciq-acct button:has-text("Sign out")');
+  await rep.waitForURL(base + '/');
+  assert.deepEqual(await rep.evaluate(() => caches.keys().then((ks) => ks.filter((k) => /^ciq-(data|shell)/.test(k)))), []);
+  assert.deepEqual(rep.errors, []);
+});
+
 test('turning a rep off locks them out and erases the app data on their device', async () => {
   const rep = await newPage();
   await signIn(rep, 'rep2@acme.test', 'rep2-password-1', '/app');

@@ -14,8 +14,11 @@ const WIPE = `function(){try{[localStorage,sessionStorage].forEach(function(s){O
 // Leaving the page: stop the parser so none of the app's own scripts run (and save) on the way out
 const HALT = `window.__CIQ_STOP=true;document.write('<plaintext hidden>');`;
 
-function js(res, status, code) {
+// x-ciq-cache tells the offline service worker (public/sw.js) to keep this response for offline
+// use ('data') or to empty its cache ('clear': signed out or turned off)
+function js(res, status, code, cache) {
   res.setHeader('Content-Type', 'application/javascript; charset=utf-8');
+  if (cache) res.setHeader('X-CIQ-Cache', cache);
   res.setHeader('Cache-Control', 'no-store');
   res.status(status).send(code);
 }
@@ -26,12 +29,13 @@ export default handler(async (req, res) => {
   try {
     ctx = await requireAccess(req, res);
   } catch (e) {
-    if (e.status === 401) return js(res, 200, `location.replace('/?next=' + encodeURIComponent(location.pathname));${HALT}`);
+    if (e.status === 401) return js(res, 200, `location.replace('/?next=' + encodeURIComponent(location.pathname));${HALT}`, 'clear');
     throw e;
   }
   const { session, db, access } = ctx;
+  res.setHeader('X-CIQ-User', session.user.id);            // the offline copy belongs to this person
   if (!access || !access.active) {
-    return js(res, 200, `(${WIPE})();location.replace('/blocked');${HALT}`);
+    return js(res, 200, `(${WIPE})();location.replace('/blocked');${HALT}`, 'clear');
   }
 
   const rows = await rpc(db, 'ciq_app_hcps', { p_offset: page * PAGE, p_limit: PAGE });
@@ -50,10 +54,12 @@ export default handler(async (req, res) => {
       + `(function(){var w=${WIPE};try{if(localStorage.getItem('ciq_owner')!==${JSON.stringify(session.user.id)}){w();localStorage.setItem('ciq_owner',${JSON.stringify(session.user.id)})}}catch(e){}})();`
       + `window.__CIQ_DATA=[];`;
     // This person's saved plan and settings: restored before the app starts when this browser
-    // doesn't have the latest copy (new iPad, cleared data, or saved from another device)
+    // doesn't have the latest copy (new iPad, cleared data, or saved from another device). The
+    // check runs in the browser too, so replaying this response offline never rolls back newer work.
     const saved = await rpc(db, 'ciq_my_state', { p_since: stateCookie(req, session.user.id) });
     if (saved && saved.data && saved.data.T && JSON.stringify(saved.data).length < 3e6) {
       code += `(function(){try{var s=${JSON.stringify({ at: saved.at, data: saved.data })};`
+        + `if(localStorage.getItem('ciq_state_at')>=s.at)return;`
         + `localStorage.setItem('tiq_territories',JSON.stringify(s.data.T));if(s.data.A)localStorage.setItem('tiq_active',s.data.A);`
         + `localStorage.setItem('ciq_welcome_seen','1');localStorage.setItem('ciq_state_at',s.at)}catch(e){}})();`;
     }
@@ -61,5 +67,5 @@ export default handler(async (req, res) => {
   }
   code += `window.__CIQ_DATA=window.__CIQ_DATA.concat(${JSON.stringify(data)});`;
   if (data.length === PAGE) code += `document.write('<script src="/api/app-data?page=${page + 1}"><\\/script>');`;
-  return js(res, 200, code);
+  return js(res, 200, code, 'data');
 });

@@ -18,13 +18,22 @@
   }
 
   // Erase CompassIQ data kept in this browser (plans, settings, cached doctors)
+  // (including the offline copy of the app and doctors kept by /sw.js)
   function wipeLocal() {
     [window.localStorage, window.sessionStorage].forEach(function (s) {
       try { Object.keys(s).forEach(function (k) { if (/^(tiq_|ciq_)/.test(k)) s.removeItem(k); }); } catch (e) { /* storage blocked */ }
     });
+    return clearOffline();
+  }
+  async function clearOffline() {
+    try {
+      if (!window.caches) return;
+      for (const k of await caches.keys()) if (/^ciq-(data|shell)/.test(k)) await caches.delete(k);
+    } catch (e) { /* caches blocked */ }
   }
 
   async function signOut() {
+    await clearOffline();
     try { await api('/api/session', { method: 'DELETE' }); } catch (e) { /* already signed out */ }
     location.replace('/');
   }

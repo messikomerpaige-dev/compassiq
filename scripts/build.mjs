@@ -29,8 +29,17 @@ if (!m) throw new Error('build: field template not found in CompassIQ_ADMIN.html
 let app = Buffer.from(m[1].replace(/\s+/g, ''), 'base64').toString('utf8');
 app = once(app, 'ALL_HCPS = []; /* BAKED empty (rep template) */',
   'ALL_HCPS = (Array.isArray(window.__CIQ_DATA) ? window.__CIQ_DATA : []); /* cloud: loaded by /api/app-data */', 'baked data line');
-app = once(app, SW_ON, SW_OFF, 'service worker registration');
-app = once(app, '<link rel="manifest" href="manifest.json">', '', 'manifest link');
+// Offline mode: the app's own registration code, pointed at /sw.js (public/sw.js) and limited to
+// the rep app (sign-in and admin pages never go through it). The worker takes over the open page
+// right away, so it only reloads after the person accepts an update.
+app = once(app, "navigator.serviceWorker.register('./sw.js')", "navigator.serviceWorker.register('/sw.js', { scope: '/app' })", 'service worker url');
+app = once(app, `navigator.serviceWorker.addEventListener('controllerchange', () => {
+        if (refreshing) return;`, `navigator.serviceWorker.addEventListener('controllerchange', () => {
+        if (refreshing || !window.__ciqUpdating) return;`, 'controllerchange reload');
+app = once(app, 'window._ciqApplyUpdate = function() {', 'window._ciqApplyUpdate = function() { window.__ciqUpdating = true;', 'apply update');
+app = once(app, '<link rel="manifest" href="manifest.json">', '<link rel="manifest" href="/manifest.webmanifest">', 'manifest link');
+app = once(app, '<link rel="icon" type="image/svg+xml" href="icon.svg">', '<link rel="icon" type="image/svg+xml" href="/icon.svg">', 'icon');
+app = once(app, '<link rel="apple-touch-icon" href="apple-touch-icon.png">', '<link rel="apple-touch-icon" href="/apple-touch-icon.png">', 'touch icon');
 app = once(app, '<head>\n<meta charset="UTF-8">',
   '<head>\n<meta charset="UTF-8">\n<script src="/api/app-data?page=0"></script>', 'head charset meta');
 app = lastBodyClose(app, '<link rel="stylesheet" href="/assets/ciq-cloud.css">\n<script src="/assets/ciq-cloud.js"></script>\n');
@@ -39,6 +48,8 @@ app = lastBodyClose(app, '<link rel="stylesheet" href="/assets/ciq-cloud.css">\n
 let tool = admin;
 tool = once(tool, SW_ON, SW_OFF, 'admin service worker registration');
 tool = once(tool, '<link rel="manifest" href="manifest.json">', '', 'admin manifest link');
+tool = once(tool, '<link rel="icon" type="image/svg+xml" href="icon.svg">', '<link rel="icon" type="image/svg+xml" href="/icon.svg">', 'admin icon');
+tool = once(tool, '<link rel="apple-touch-icon" href="apple-touch-icon.png">', '<link rel="apple-touch-icon" href="/apple-touch-icon.png">', 'admin touch icon');
 tool = once(tool, 'onclick="_agxPublish()" disabled>Generate rep version</button>',
   'onclick="_agxPublish()" disabled>Publish to reps</button>', 'console publish button');
 tool = once(tool, '<h2>Rep version ready</h2>', '<h2>Published to reps</h2>', 'done heading');

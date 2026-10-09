@@ -20817,7 +20817,11 @@ const _ADMIN_PW_KEY  = 'tiq_admin_pw';
         window.addEventListener('online', function () { schedule(500); });
         document.addEventListener('visibilitychange', function () { if (document.visibilityState === 'hidden' && pending()) flush(); });
       })
-      .catch(function () {});
+      .catch(function () {
+        // Opened offline: start syncing when the connection comes back (anything logged in the
+        // meantime is picked up by the first scan)
+        if (!enabled && !navigator.onLine) window.addEventListener('online', function () { setTimeout(start, 1000); }, { once: true });
+      });
   }
   window.CIQSync = { status: function () { return { enabled: enabled, email: me, pending: pending(), last: load(LAST_KEY, {}) }; }, flush: flush, scan: scan,
     prefsOf: prefsOf, prefsSig: prefsSig };

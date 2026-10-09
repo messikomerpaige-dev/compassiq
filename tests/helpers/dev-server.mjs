@@ -12,9 +12,11 @@ import ping from '../../api/ping.js';
 import sync from '../../api/sync.js';
 import prefs from '../../api/prefs.js';
 import state from '../../api/state.js';
+import activity from '../../api/activity.js';
+import team from '../../api/team.js';
 
 const PUBLIC = fileURLToPath(new URL('../../public/', import.meta.url));
-const API = { session, admin, platform, 'app-data': appData, ping, sync, prefs, state };
+const API = { session, admin, platform, 'app-data': appData, ping, sync, prefs, state, activity, team };
 const TYPES = { '.html': 'text/html; charset=utf-8', '.js': 'application/javascript', '.css': 'text/css', '.json': 'application/json' };
 
 async function fileFor(path) {
@@ -42,7 +44,7 @@ export function startServer(fake, port = 0) {
       const m = url.pathname.match(/^\/api\/([\w-]+)$/);
       if (m && API[m[1]]) {
         req.query = Object.fromEntries(url.searchParams);
-        req.body = raw ? JSON.parse(raw) : undefined;
+        req.body = !raw ? undefined : (() => { try { return JSON.parse(raw); } catch { return raw; } })();
         return await API[m[1]](req, res);
       }
       const f = await fileFor(url.pathname === '/' ? '/index.html' : url.pathname);
