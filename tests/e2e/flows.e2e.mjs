@@ -20,6 +20,9 @@ async function newPage() {
   const ctx = await browser.newContext({ viewport: { width: 1180, height: 820 } });   // iPad landscape
   await ctx.route('https://cdn.jsdelivr.net/npm/@supabase/**', (r) => r.fulfill({ contentType: 'application/javascript', body: SUPABASE_JS_STUB }));
   await ctx.route(/^https:\/\/(cdnjs\.cloudflare\.com|fonts\.(googleapis|gstatic)\.com|server\.arcgisonline\.com)\//, (r) => r.abort());
+  // The spreadsheet reader the admin page loads from the CDN
+  await ctx.route('https://cdnjs.cloudflare.com/ajax/libs/xlsx/0.18.5/xlsx.full.min.js',
+    (r) => r.fulfill({ contentType: 'application/javascript', path: new URL('../../node_modules/xlsx/dist/xlsx.full.min.js', import.meta.url).pathname }));
   // Supabase's own "update my password" endpoint (the set-password page calls it directly)
   await ctx.route('http://supabase.test/auth/v1/user', async (r) => {
     const token = (r.request().headers().authorization || '').replace(/^Bearer /, '');
@@ -135,6 +138,40 @@ test('the owner invites reps and a manager', async () => {
     await fake.db.query('select 1');   // keep the fake's db warm
     fake.state.passwords.set(inv.id, email.split('@')[0] + '-password-1');
   }
+  assert.deepEqual(page.errors, []);
+});
+
+test('the owner imports people from a sheet; the email limit stops it cleanly', async () => {
+  const page = await newPage();
+  await signIn(page, 'owner@acme.test', 'owner-password-1', '/admin');
+  await page.waitForSelector('#territories tr:has-text("South")');
+  await page.click('#import-open');
+  const csv = ['Email,Name,Role,Territory',
+    'new1@acme.test,New One,Rep,North',
+    'new2@acme.test,New Two,Sales Rep,south',
+    'new3@acme.test,New Three,District Manager,"North; South"',
+    'rep1@acme.test,Rita Rep,Rep,North',
+    'bad@acme.test,Bad,Rep,Atlantis'].join('\n');
+  await page.setInputFiles('#import-file', { name: 'people.csv', mimeType: 'text/csv', buffer: Buffer.from(csv) });
+  await page.waitForSelector('#import-preview:not([hidden])');
+  assert.equal(await page.textContent('#import-go'), 'Send 3 invites');
+  assert.match(await page.textContent('#import-stats'), /3\s*to invite[\s\S]*1\s*no change[\s\S]*1\s*need fixing/);
+  assert.match(await page.textContent('#import-rows'), /No territory called “Atlantis”/);
+  // Only one more email may go out before the limit
+  fake.state.inviteLimit = fake.state.invites.length + 1;
+  await page.click('#import-go');
+  await page.waitForSelector('#import-msg.show');
+  assert.match(await page.textContent('#import-msg'), /1 done · 2 waiting for the email limit/);
+  // Later: the limit resets; importing the same sheet sends the rest
+  fake.state.inviteLimit = null;
+  await page.setInputFiles('#import-file', { name: 'people.csv', mimeType: 'text/csv', buffer: Buffer.from(csv) });
+  await page.waitForFunction(() => document.getElementById('import-go').textContent === 'Send 2 invites');
+  await page.click('#import-go');
+  await page.waitForFunction(() => /2 done\./.test(document.getElementById('import-msg').textContent));
+  await page.click('#import-cancel');
+  for (const name of ['New One', 'New Two', 'New Three']) await page.waitForSelector(`#people tr:has-text("${name}")`);
+  const row = await page.textContent('#people tr:has-text("New Three")');
+  assert.match(row, /manager[\s\S]*North, South/i);
   assert.deepEqual(page.errors, []);
 });
 

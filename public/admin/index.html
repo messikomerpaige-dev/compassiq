@@ -32,7 +32,10 @@
   <section class="panel">
     <div class="panel-head">
       <h2>Team</h2>
-      <button class="btn sm" id="invite-open" type="button">Invite someone</button>
+      <div class="row-actions">
+        <button class="btn secondary sm" id="import-open" type="button">Import from a sheet</button>
+        <button class="btn sm" id="invite-open" type="button">Invite someone</button>
+      </div>
     </div>
     <div class="table-wrap"><table>
       <thead><tr><th>Name</th><th>Role</th><th>Territories</th><th>Status</th><th></th></tr></thead>
@@ -77,7 +80,34 @@
   </form>
 </dialog>
 
+<dialog id="import-dlg" class="wide">
+  <h2>Import people from a sheet</h2>
+  <p class="muted small">One row per person with <b>Email</b>, <b>Name</b>, <b>Role</b> (Rep, Manager, Admin or Owner) and
+    <b>Territory</b>, spelled as in your doctor data. A manager with several territories: separate them with <b>;</b>.
+    People already on the team are updated instead of invited again.</p>
+  <div class="row-actions" style="margin:10px 0 4px;">
+    <label class="btn secondary sm" for="import-file" style="margin:0;">Choose Excel or CSV file…</label>
+    <input type="file" id="import-file" accept=".xlsx,.xls,.csv" hidden>
+    <button class="linkbtn" id="import-template" type="button">Download the template</button>
+    <span class="muted small" id="import-file-name"></span>
+  </div>
+  <div class="msg" id="import-msg" role="alert"></div>
+  <div id="import-preview" hidden>
+    <div class="stats" id="import-stats" style="margin:14px 0;"></div>
+    <div class="table-wrap" style="max-height:44vh;overflow:auto;"><table>
+      <thead><tr><th>Row</th><th>Person</th><th>Role</th><th>Territories</th><th>What happens</th></tr></thead>
+      <tbody id="import-rows"></tbody>
+    </table></div>
+  </div>
+  <div class="dialog-actions">
+    <span class="muted small" id="import-progress" style="margin-right:auto;align-self:center;"></span>
+    <button class="btn secondary" type="button" id="import-cancel">Close</button>
+    <button class="btn" type="button" id="import-go" disabled>Send</button>
+  </div>
+</dialog>
+
 <script src="/assets/ciq-page.js"></script>
+<script src="/assets/ciq-import.js"></script>
 <script>
 (function () {
   'use strict';
@@ -211,6 +241,97 @@
       showMsg($('page-msg'), err.message);
     }
   }
+
+  // ── Import from a sheet ────────────────────────────────────────────────
+  let plan = [], sending = false;
+  const XLSX_SRC = 'https://cdnjs.cloudflare.com/ajax/libs/xlsx/0.18.5/xlsx.full.min.js';
+  function loadXlsx() {
+    if (window.XLSX) return Promise.resolve(window.XLSX);
+    return new Promise((resolve, reject) => {
+      const sc = document.createElement('script'); sc.src = XLSX_SRC;
+      sc.onload = () => resolve(window.XLSX); sc.onerror = () => reject(new Error('Could not load the spreadsheet reader — check your connection.'));
+      document.head.appendChild(sc);
+    });
+  }
+  const ACTION_PILL = { invite: ['ok', 'Invite'], update: ['role', 'Update'], skip: ['', 'Skip'], error: ['off', 'Fix'],
+    done: ['ok', 'Sent'], updated: ['ok', 'Updated'], failed: ['off', 'Failed'], held: ['', 'Not sent'] };
+
+  function renderPlan() {
+    const count = (a) => plan.filter((it) => it.action === a).length;
+    $('import-preview').hidden = !plan.length;
+    $('import-stats').replaceChildren(...[[count('invite'), 'to invite'], [count('update'), 'to update'], [count('skip'), 'no change'],
+      [count('error'), 'need fixing']].map(([n, l]) => h('div', { class: 'stat' }, h('b', {}, String(n)), h('span', {}, l))));
+    $('import-rows').replaceChildren(...plan.map((it) => {
+      const [cls, label] = ACTION_PILL[it.action];
+      return h('tr', {},
+        h('td', { class: 'num muted' }, String(it.row)),
+        h('td', {}, h('div', {}, it.name || it.email), it.name ? h('div', { class: 'muted small' }, it.email) : null),
+        h('td', {}, it.role ? h('span', { class: 'pill role' }, it.role) : h('span', { class: 'muted small' }, it.roleRaw || '—')),
+        h('td', { class: 'small' }, ['owner', 'admin'].includes(it.role) ? 'All' : (it.territoryNames.join(', ') || '—')),
+        h('td', { class: 'small' }, h('span', { class: 'pill ' + cls }, label), ' ', it.note));
+    }));
+    const n = count('invite'), u = count('update');
+    $('import-go').disabled = sending || !(n + u);
+    $('import-go').textContent = n + u ? 'Send ' + [n && n + ' invite' + (n === 1 ? '' : 's'), u && u + ' update' + (u === 1 ? '' : 's')].filter(Boolean).join(' & ') : 'Send';
+  }
+
+  $('import-open').addEventListener('click', () => {
+    plan = []; $('import-file').value = ''; $('import-file-name').textContent = ''; $('import-progress').textContent = '';
+    showMsg($('import-msg'), ''); renderPlan(); $('import-dlg').showModal();
+  });
+  $('import-cancel').addEventListener('click', () => { if (!sending) $('import-dlg').close(); });
+  $('import-template').addEventListener('click', () => {
+    const blob = new Blob([window.CIQImport.templateCsv(state)], { type: 'text/csv;charset=utf-8' });
+    const a = h('a', { href: URL.createObjectURL(blob), download: 'CompassIQ_People_Template.csv' }); document.body.appendChild(a); a.click(); a.remove();
+  });
+  $('import-file').addEventListener('change', async () => {
+    const f = $('import-file').files[0]; if (!f) return;
+    $('import-file-name').textContent = f.name; showMsg($('import-msg'), ''); $('import-progress').textContent = '';
+    try {
+      const XLSX = await loadXlsx();
+      const wb = XLSX.read(new Uint8Array(await f.arrayBuffer()), { type: 'array' });
+      const rows = XLSX.utils.sheet_to_json(wb.Sheets[wb.SheetNames[0]], { header: 1, defval: '', raw: false });
+      const res = window.CIQImport.planImport(rows, state);
+      plan = res.items;
+      if (res.error) showMsg($('import-msg'), res.error);
+    } catch (err) { plan = []; showMsg($('import-msg'), err.message || 'Could not read that file.'); }
+    renderPlan();
+  });
+
+  $('import-go').addEventListener('click', async () => {
+    const todo = plan.filter((it) => it.action === 'invite' || it.action === 'update');
+    if (!todo.length) return;
+    sending = true; $('import-cancel').disabled = true; renderPlan();
+    let done = 0, failed = 0, held = 0;
+    for (let i = 0; i < todo.length; i++) {
+      const it = todo[i];
+      $('import-progress').textContent = 'Sending ' + (i + 1) + ' of ' + todo.length + '…';
+      try {
+        if (it.action === 'invite') {
+          const r = await api('/api/admin', { method: 'POST', body: { action: 'invite', email: it.email, full_name: it.name, role: it.role, territory_ids: it.territoryIds } });
+          it.action = 'done'; it.note = r.existing ? 'Added — they already had a login and can sign in now' : 'Invite sent';
+        } else {
+          await api('/api/admin', { method: 'POST', body: { action: 'update', user_id: it.userId, role: it.role, territory_ids: ['owner', 'admin'].includes(it.role) ? [] : it.territoryIds, full_name: it.name || null } });
+          it.action = 'updated'; it.note = 'Updated';
+        }
+        done++;
+      } catch (err) {
+        if (/rate limit/i.test(err.message)) {
+          // Email limit: stop here; re-importing the same sheet later picks up the rest
+          todo.slice(i).forEach((x) => { if (x.action === 'invite' || x.action === 'update') { x.action = 'held'; x.note = 'Not sent — the email limit was reached. Import the same sheet again later to send the rest.'; held++; } });
+          break;
+        }
+        it.action = 'failed'; it.note = err.message; failed++;
+      }
+      renderPlan();
+    }
+    sending = false; $('import-cancel').disabled = false;
+    $('import-progress').textContent = '';
+    showMsg($('import-msg'), done + ' done' + (failed ? ' · ' + failed + ' failed' : '') + (held ? ' · ' + held + ' waiting for the email limit to reset' : '') + '.',
+      failed || held ? 'err' : 'ok');
+    renderPlan();
+    try { state = await api('/api/admin'); render(); } catch (e) { /* page refresh shows it */ }
+  });
 
   load();
 })();

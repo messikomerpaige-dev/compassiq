@@ -100,6 +100,9 @@ export async function createFakeSupabase() {
         async resetPasswordForEmail(email, o) { state.resets.push({ email, redirectTo: o && o.redirectTo }); return { error: null }; },
         admin: isService ? {
           async inviteUserByEmail(email, o) {
+            if (state.inviteLimit != null && state.invites.length >= state.inviteLimit) {
+              return { data: { user: null }, error: { status: 429, code: 'over_email_send_rate_limit', message: 'email rate limit exceeded' } };
+            }
             const exists = (await users()).some((u) => u.email === email.toLowerCase());
             if (exists) return { data: { user: null }, error: { code: 'email_exists', message: 'A user with this email address has already been registered' } };
             const id = await createUser(email);
