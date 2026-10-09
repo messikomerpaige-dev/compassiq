@@ -67,6 +67,7 @@ export async function getSession(req, res) {
   if (c[AT]) {
     const { data, error } = await anonClient().auth.getUser(c[AT]);
     if (!error && data && data.user) return { user: data.user, accessToken: c[AT] };
+    console.warn('[session] access token rejected:', (error && (error.code || error.message)) || 'no user');
   }
   if (c[RT]) {
     const { data, error } = await anonClient().auth.refreshSession({ refresh_token: c[RT] });
@@ -74,7 +75,10 @@ export async function getSession(req, res) {
       setSessionCookies(req, res, data.session);
       return { user: data.user, accessToken: data.session.access_token };
     }
+    console.warn('[session] refresh failed:', (error && (error.code || error.message)) || 'no session');
     clearSessionCookies(req, res);
+  } else if (!c[AT]) {
+    console.warn('[session] no session cookies on', req.url || '(request)');
   }
   return null;
 }

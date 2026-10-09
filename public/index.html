@@ -61,6 +61,9 @@
     location.replace(next || me.home || '/app');
   }
 
+  if (new URLSearchParams(location.search).get('saved')) {
+    showMsg($('msg'), 'Your password is saved — sign in with it now.', 'ok');
+  }
   // Already signed in → straight to the right place
   api('/api/session').then((me) => location.replace(next || me.home)).catch(() => { $('email').focus(); });
 

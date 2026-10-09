@@ -13,12 +13,22 @@ process.env.SUPABASE_ANON_KEY = 'anon-key';
 process.env.SUPABASE_SERVICE_ROLE_KEY = 'service-key';
 
 let fake, server, base, browser;
+const pwUpdates = [];
 const ids = {};
 
 async function newPage() {
   const ctx = await browser.newContext({ viewport: { width: 1180, height: 820 } });   // iPad landscape
   await ctx.route('https://cdn.jsdelivr.net/npm/@supabase/**', (r) => r.fulfill({ contentType: 'application/javascript', body: SUPABASE_JS_STUB }));
   await ctx.route(/^https:\/\/(cdnjs\.cloudflare\.com|fonts\.(googleapis|gstatic)\.com|server\.arcgisonline\.com)\//, (r) => r.abort());
+  // Supabase's own "update my password" endpoint (the set-password page calls it directly)
+  await ctx.route('http://supabase.test/auth/v1/user', async (r) => {
+    const token = (r.request().headers().authorization || '').replace(/^Bearer /, '');
+    const id = fake.state.access.get(token);
+    if (!id || r.request().method() !== 'PUT') return r.fulfill({ status: 401, contentType: 'application/json', body: '{"msg":"invalid JWT"}' });
+    fake.state.passwords.set(id, JSON.parse(r.request().postData()).password);
+    pwUpdates.push(id);
+    r.fulfill({ contentType: 'application/json', body: JSON.stringify({ id }) });
+  });
   const page = await ctx.newPage();
   page.errors = [];
   page.on('pageerror', (e) => page.errors.push(e.message));
@@ -72,6 +82,7 @@ test('the CompassIQ team adds a company; the owner accepts the invite', async ()
   await owner.fill('#pw2', 'owner-password-1');
   await owner.click('#go');
   await owner.waitForURL(base + '/admin');
+  assert.deepEqual(pwUpdates, [inv.id], 'password saved with Supabase using the link’s sign-in');
   await owner.waitForSelector('#last-publish:has-text("No doctor data published yet")');
   assert.deepEqual(page.errors.concat(owner.errors), []);
 });
