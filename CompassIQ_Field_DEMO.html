@@ -3009,6 +3009,14 @@
     <div id="trend-card-body"></div>
   </div>
 
+  <!-- v4.6: Call activity — completed calls from the data warehouse -->
+  <div class="card mb-16" id="activity-card">
+    <div class="card-title">Call activity</div>
+    <div class="form-hint" style="margin:-6px 0 4px;font-size:12px;line-height:1.55;">Load completed calls from your data warehouse, or pull them live. Mid-quarter plans then schedule only the calls each doctor still needs to reach goal, and doctors not reached yet go first.</div>
+    <input type="file" id="activity-file-input" accept=".csv,.xlsx,.xls" style="display:none;" onchange="importActivityFile(this)">
+    <div id="activity-card-body"></div>
+  </div>
+
   <div class="grid2 gap-16 mb-16">
     <div class="card">
       <div class="card-title">Work Hours &amp; Targets</div>
@@ -3999,7 +4007,7 @@ let STATE = defaultTerritoryData();
 
 // Increment this whenever the routing algorithm changes significantly.
 // Plans generated with an older version will show a "regenerate" warning.
-const ROUTING_VERSION = 29; // v29: coverage-fill geo-weighted sort per day + resequence covers coverage-fill days
+const ROUTING_VERSION = 30; // v30: call activity — remaining-to-goal planning, unreached first. v29: coverage-fill geo-weighted sort per day + resequence covers coverage-fill days
 
 // ═══════════════════════════════════════════════════════════════════
 // PERSISTENCE
@@ -5195,6 +5203,9 @@ function getZIP5(address) {
 function qCalls(callGoal, hcp) {
   // v4.2: prorate the quarterly goal when the plan covers only part of a quarter.
   // Trend extras and missed-call boosts are added on top, unprorated.
+  // v4.6: call activity for the plan's quarter → calls still needed (goal + trend − done), no proration
+  const act = hcp && typeof ciqActivity === 'function' ? ciqActivity(hcp, callGoal) : null;
+  if (act) return act.remaining;
   const f = _ciqProrateFactor();
   const base = f >= 1 ? Math.ceil(callGoal / 4) : Math.max(1, Math.round((callGoal / 4) * f));
   return base + (hcp?._missedBoost || 0) + trendAdd(hcp);
@@ -5267,8 +5278,10 @@ function _ciqFormWindow() {
 // Goal for one HCP under a given (preview) window, without touching saved state
 function _ciqGoalPreview(h, fw) {
   const prev = window._ciqProrateOverride;
+  const prevStart = window._ciqActStartOverride;
   window._ciqProrateOverride = fw ? fw.factor : 1;
-  try { return qCalls(h.callGoal || 4, h); } finally { window._ciqProrateOverride = prev; }
+  window._ciqActStartOverride = fw ? fw.start : undefined;
+  try { return qCalls(h.callGoal || 4, h); } finally { window._ciqProrateOverride = prev; window._ciqActStartOverride = prevStart; }
 }
 
 // ═══════════════════════════════════════════════════════════════════
@@ -5451,6 +5464,274 @@ function renderTrendCard() {
       ${m ? '<button class="btn btn-danger btn-sm" onclick="clearTrends()">Clear trends</button>' : ''}
     </div>
     <div class="form-hint" style="margin-top:10px;line-height:1.55;">Changes apply the next time you build the plan (Plan → Build plan). Flagged doctors are trimmed last if the quarter runs out of slots.</div>`;
+}
+
+// ═══════════════════════════════════════════════════════════════════
+// CALL ACTIVITY (v4.6) — completed calls from the data warehouse.
+// Template: NPI, Call_Date, Call_Type, Status  (one row per call)
+//       or: NPI, Calls_QTD, As_Of             (one row per doctor)
+// Each HCP record carries h.act = { q, asOf, last, byType, done, ex? }:
+//   q      — quarter the counts cover ('2026-Q4', the quarter of asOf)
+//   byType — completed calls in that quarter by call type (one per doctor per day)
+//   done   — calls that count toward the goal (byType minus excluded types `ex`)
+// When a plan starts in that same quarter, qCalls() plans the calls still
+// needed (quarterly goal + trend extras − done) instead of prorating the goal,
+// and doctors with no calls yet get an earlier first visit.
+// Fields live on the HCP record, like trends, so they travel with saves,
+// backups and published field builds.
+// Live pull: GET /api/activity?from=YYYY-MM-DD[&territory=…] →
+//   { asOf: 'YYYY-MM-DD', calls: [{ npi, date, type?, status? }, …] }
+// ═══════════════════════════════════════════════════════════════════
+const ACT_SKIP_STATUS = /^(plan|schedul|cancel|delet|draft|saved|pending|missed|declin|void|notsubmit|open)/;
+
+function _actQuarterKey(iso) { const qb = _ciqQuarterOf(iso); return qb.year + '-Q' + qb.q; }
+function _actQuarterLabel(key) { const m = /^(\d{4})-Q(\d)$/.exec(key || ''); return m ? 'Q' + m[2] + ' ' + m[1] : ''; }
+
+// First day of the plan the goals are for: Build-plan preview, saved plan, or today
+function _actPlanStart() {
+  if (typeof window !== 'undefined' && window._ciqActStartOverride) return window._ciqActStartOverride;
+  return (typeof STATE !== 'undefined' && STATE.planStartDate) || _ciqIso(new Date());
+}
+
+// Activity for one HCP against the plan's quarter, or null when none applies
+function ciqActivity(h, callGoal) {
+  const a = h && h.act;
+  if (!a || !a.q || a.q !== _actQuarterKey(_actPlanStart())) return null;
+  const g = callGoal != null ? callGoal : (h.callGoal || 4);
+  const goal = Math.ceil(g / 4) + trendAdd(h);
+  const done = a.done || 0;
+  return { done, goal, remaining: Math.max(0, goal - done), asOf: a.asOf, last: a.last || null };
+}
+
+function _actParseDate(v) {
+  if (v == null || v === '') return null;
+  if (v instanceof Date && !isNaN(v)) return _ciqIso(v);
+  if (typeof v === 'number' && v > 20000 && v < 80000) {          // Excel serial date
+    const d = new Date(Date.UTC(1899, 11, 30) + Math.round(v) * 864e5);
+    return d.toISOString().slice(0, 10);
+  }
+  const s = String(v).trim();
+  let m = /^(\d{4})-(\d{1,2})-(\d{1,2})/.exec(s);
+  if (m) return m[1] + '-' + m[2].padStart(2, '0') + '-' + m[3].padStart(2, '0');
+  m = /^(\d{1,2})\/(\d{1,2})\/(\d{2}|\d{4})\b/.exec(s);
+  if (m) return (m[3].length === 2 ? '20' + m[3] : m[3]) + '-' + m[1].padStart(2, '0') + '-' + m[2].padStart(2, '0');
+  const d = new Date(s);
+  return isNaN(d) ? null : _ciqIso(d);
+}
+
+function _actDone(byType, ex) {
+  const skip = new Set(ex || []);
+  return Object.keys(byType || {}).reduce((s, t) => s + (skip.has(t) ? 0 : byType[t]), 0);
+}
+
+// Call types currently excluded (stored on the records so published builds keep them)
+function _actExcluded() {
+  const src = (STATE.hcps || []).find(h => h.act) || ((typeof ALL_HCPS !== 'undefined' && Array.isArray(ALL_HCPS)) ? ALL_HCPS.find(h => h.act) : null);
+  return (src && src.act && src.act.ex) || [];
+}
+
+function downloadActivityTemplate() {
+  const rows = [
+    ['NPI', 'Call_Date', 'Call_Type', 'Status'],
+    ['1234567890', '2026-10-01', 'In-person', 'Submitted'],
+    ['1234567890', '2026-10-15', 'Virtual', 'Submitted'],
+    ['1234567891', '2026-10-06', 'In-person', 'Submitted'],
+    ['1234567892', '2026-10-08', 'In-person', 'Planned'],
+  ];
+  const csv = rows.map(r => r.join(',')).join('\r\n') + '\r\n';
+  downloadFile(csv, 'CompassIQ_Call_Activity_Template.csv', 'text/csv;charset=utf-8');
+  showToast('✓ Template downloaded — one row per call; Call_Type and Status are optional');
+}
+
+function importActivityFile(input) {
+  const file = input.files && input.files[0];
+  if (!file) return;
+  const reader = new FileReader();
+  reader.onload = e => {
+    try {
+      const wb = XLSX.read(new Uint8Array(e.target.result), { type: 'array' });
+      const rows = XLSX.utils.sheet_to_json(wb.Sheets[wb.SheetNames[0]], { header: 1, defval: '' });
+      applyActivityRows(rows, file.name, 'file');
+    } catch (err) {
+      console.error('[activity] parse failed', err);
+      showToast('⚠ Could not read that file — use the CSV template');
+    }
+    input.value = '';
+  };
+  reader.readAsArrayBuffer(file);
+}
+
+// Returns { ok, matched, reached, asOf, q } (also used by the admin console).
+// asOfHint: the source's "data through" date, when it knows one (live pull)
+function applyActivityRows(rows, fileName, source, asOfHint) {
+  const fail = msg => { showToast('⚠ ' + msg); return { ok: false, error: msg }; };
+  if (!rows || rows.length < 2) return fail('Call activity file is empty');
+  const head = rows[0].map(c => String(c).trim().toLowerCase().replace(/[^a-z0-9]/g, ''));
+  const col = (...names) => head.findIndex(h => names.some(n => h === n || h.startsWith(n)));
+  const iNpi = col('npi', 'hcpnpi', 'prescribernpi');
+  const iDate = col('calldate', 'activitydate', 'visitdate', 'interactiondate', 'date');
+  const iCount = col('callsqtd', 'qtdcalls', 'callcount', 'calls', 'count');
+  const iAsOf = col('asof', 'asofdate', 'datathrough', 'through');
+  const iType = col('calltype', 'activitytype', 'channel', 'type');
+  const iStatus = col('callstatus', 'status');
+  if (iNpi < 0 || (iDate < 0 && iCount < 0)) return fail('Call activity needs NPI and Call_Date (or Calls_QTD) columns — download the template');
+
+  // Pass 1: dates → as-of (latest completed call, or the As_Of column for count files)
+  const body = rows.slice(1).filter(r => String(r[iNpi] || '').replace(/\D/g, ''));
+  const counted = r => iStatus < 0 || !ACT_SKIP_STATUS.test(String(r[iStatus] || '').toLowerCase().replace(/[^a-z]/g, ''));
+  let asOf = null, skipped = 0, badDate = 0;
+  if (iDate >= 0) {
+    body.forEach(r => { if (!counted(r)) return; const d = _actParseDate(r[iDate]); if (d && (!asOf || d > asOf)) asOf = d; });
+  } else {
+    body.forEach(r => { const d = iAsOf >= 0 ? _actParseDate(r[iAsOf]) : null; if (d && (!asOf || d > asOf)) asOf = d; });
+    asOf = asOf || _ciqIso(new Date());
+  }
+  const hint = _actParseDate(asOfHint);                     // server's "data through" date wins when later
+  if (hint && (!asOf || hint > asOf)) asOf = hint;
+  if (!asOf) return fail('No completed calls with a readable date in that file');
+  const q = _actQuarterKey(asOf), qb = _ciqQuarterOf(asOf);
+
+  // Pass 2: per-NPI counts in the as-of quarter (one call per doctor per day)
+  const map = {}, seenDay = new Set();
+  body.forEach(r => {
+    if (!counted(r)) { skipped++; return; }
+    const npi = String(r[iNpi]).replace(/\D/g, '');
+    const type = iType >= 0 ? (String(r[iType] || '').trim().slice(0, 40) || 'Unspecified') : 'All calls';
+    const e = map[npi] || (map[npi] = { byType: {}, last: null });
+    if (iDate >= 0) {
+      const d = _actParseDate(r[iDate]);
+      if (!d) { badDate++; return; }
+      if (!e.last || d > e.last) e.last = d;
+      if (d < qb.start || d > qb.end || seenDay.has(npi + '|' + d)) return;
+      seenDay.add(npi + '|' + d);
+      e.byType[type] = (e.byType[type] || 0) + 1;
+    } else {
+      const n = parseInt(String(r[iCount]).replace(/[^\d.-]/g, ''), 10);
+      if (n > 0) e.byType[type] = (e.byType[type] || 0) + n;
+    }
+  });
+
+  const ex = _actExcluded();
+  const apply = h => {
+    const e = map[String(h.npi || '').replace(/\D/g, '')];
+    const byType = e ? e.byType : {};
+    h.act = { q, asOf, last: e ? e.last : null, byType, done: _actDone(byType, ex) };
+    if (ex.length) h.act.ex = ex.slice();
+    return !!(e && h.act.done > 0);
+  };
+  const reached = STATE.hcps.filter(apply).length;
+  if (typeof ALL_HCPS !== 'undefined' && Array.isArray(ALL_HCPS)) ALL_HCPS.forEach(apply);
+  const isFieldBuild = typeof __CLEARPATH_IS_FIELD_BUILD__ !== 'undefined' && __CLEARPATH_IS_FIELD_BUILD__;
+  STATE.activityMeta = {
+    fileName: fileName || (source === 'live' ? 'Data warehouse' : 'file'), source: source || 'file',
+    loadedAt: new Date().toISOString(), asOf, q, npis: Object.keys(map).length, reached,
+    skipped, badDate, by: isFieldBuild ? 'rep' : 'admin',
+  };
+  saveState();
+  if (typeof saveAllHCPs === 'function') { try { saveAllHCPs(); } catch (e) {} }
+  renderActivityCard();
+  if (typeof window._agxRefresh === 'function') { try { window._agxRefresh(); } catch (e) {} }
+  showToast(`✓ Call activity through ${asOf} — ${reached} of your ${STATE.hcps.length} doctors reached in ${_actQuarterLabel(q)}` +
+    (skipped ? ` · ${skipped} not-completed rows skipped` : '') +
+    (STATE.plan && STATE.plan.length ? ' · Rebuild your plan to apply' : ''));
+  return { ok: true, matched: reached, reached, asOf, q, npis: Object.keys(map).length };
+}
+
+// Live pull from the CompassIQ server (the cloud version proxies the warehouse)
+function pullWarehouseActivity() {
+  if (!/^https?:$/.test(location.protocol)) { showToast('⚠ Live warehouse pull works when CompassIQ is opened from its web address'); return; }
+  const isFieldBuild = typeof __CLEARPATH_IS_FIELD_BUILD__ !== 'undefined' && __CLEARPATH_IS_FIELD_BUILD__;
+  const from = _ciqQuarterOf(_ciqIso(new Date())).start;
+  const terr = (typeof TERRITORIES !== 'undefined' && TERRITORIES[ACTIVE_TERRITORY_ID]) ? TERRITORIES[ACTIVE_TERRITORY_ID].name : '';
+  const url = '/api/activity?from=' + from + (isFieldBuild && terr ? '&territory=' + encodeURIComponent(terr) : '');
+  showToast('Pulling call activity from the data warehouse…');
+  fetch(url, { credentials: 'same-origin', cache: 'no-store' })
+    .then(r => {
+      if (r.status === 404) throw new Error('Live warehouse sync isn’t set up on this server yet — load a file instead');
+      if (r.status === 401 || r.status === 403) throw new Error('Sign in again to pull call activity');
+      if (!r.ok) throw new Error('Warehouse pull failed (HTTP ' + r.status + ')');
+      return r.json();
+    })
+    .then(res => {
+      const calls = (res && Array.isArray(res.calls)) ? res.calls : null;
+      if (!calls) throw new Error('Warehouse response had no calls list');
+      const rows = [['NPI', 'Call_Date', 'Call_Type', 'Status']].concat(
+        calls.map(c => [c.npi || '', c.date || '', c.type || '', c.status || '']));
+      if (rows.length < 2) { showToast('No calls found in the data warehouse for this quarter yet'); return; }
+      applyActivityRows(rows, 'Data warehouse', 'live', res.asOf);
+    })
+    .catch(e => showToast('⚠ ' + (e.message || e)));
+}
+
+function setActivityTypeCounted(type, counted) {
+  const ex = new Set(_actExcluded());
+  if (counted) ex.delete(type); else ex.add(type);
+  const list = [...ex];
+  const upd = h => {
+    if (!h.act) return;
+    if (list.length) h.act.ex = list.slice(); else delete h.act.ex;
+    h.act.done = _actDone(h.act.byType, list);
+  };
+  STATE.hcps.forEach(upd);
+  if (typeof ALL_HCPS !== 'undefined' && Array.isArray(ALL_HCPS)) ALL_HCPS.forEach(upd);
+  saveState();
+  if (typeof saveAllHCPs === 'function') { try { saveAllHCPs(); } catch (e) {} }
+  renderActivityCard();
+}
+
+function clearActivity() {
+  if (!confirm('Remove call activity from this territory? Plans will go back to prorating goals mid-quarter.')) return;
+  STATE.hcps.forEach(h => { delete h.act; });
+  if (typeof ALL_HCPS !== 'undefined' && Array.isArray(ALL_HCPS)) ALL_HCPS.forEach(h => { delete h.act; });
+  STATE.activityMeta = null;
+  saveState();
+  if (typeof saveAllHCPs === 'function') { try { saveAllHCPs(); } catch (e) {} }
+  renderActivityCard();
+  showToast('Call activity cleared');
+}
+
+function renderActivityCard() {
+  const el = document.getElementById('activity-card-body');
+  if (!el) return;
+  const withAct = STATE.hcps.filter(h => h.act && !h.doNotCall);
+  const a0 = withAct[0] && withAct[0].act;
+  const m = STATE.activityMeta;
+  const live = /^https?:$/.test(location.protocol);
+  let status;
+  if (!a0) {
+    status = 'No call activity loaded. Mid-quarter plans scale each goal by the share of the quarter left.';
+  } else {
+    const planQ = _actQuarterKey(_actPlanStart());
+    const stats = withAct.reduce((s, h) => {
+      const g = Math.ceil((h.callGoal || 4) / 4) + trendAdd(h), d = h.act.done || 0;
+      s.done += d; s.goal += g;
+      if (d > 0) s.reached++;
+      if (d >= g) s.atGoal++;
+      return s;
+    }, { done: 0, goal: 0, reached: 0, atGoal: 0 });
+    status = `Calls through <b>${a0.asOf}</b> (${_actQuarterLabel(a0.q)}) · <b>${stats.reached}</b> of ${withAct.length} doctors reached · ${stats.atGoal} at goal · ${stats.done} of ${stats.goal} calls done` +
+      (m ? ` · ${m.fileName} · loaded ${new Date(m.loadedAt).toLocaleDateString('en-US', { month: 'short', day: 'numeric' })} by ${m.by}` : '') +
+      (planQ !== a0.q ? `<div style="color:#b45309;margin-top:6px;">⚠ Your plan starts in ${_actQuarterLabel(planQ)}, so this ${_actQuarterLabel(a0.q)} activity isn’t used. Load current-quarter activity or start the plan in ${_actQuarterLabel(a0.q)}.</div>` : '');
+  }
+  const byType = {};
+  withAct.forEach(h => Object.keys(h.act.byType || {}).forEach(t => { byType[t] = (byType[t] || 0) + h.act.byType[t]; }));
+  const ex = new Set(_actExcluded());
+  const types = Object.keys(byType).sort();
+  const typeRows = types.length > 1 ? `
+    <div class="table-wrap" style="margin:12px 0;"><table>
+      <thead><tr><th>Call type</th><th>Calls</th><th>Counts toward goal</th></tr></thead>
+      <tbody>${types.map(t => `<tr><td>${t.replace(/[<>&"]/g, '')}</td><td class="td-mono">${byType[t]}</td>
+        <td><input type="checkbox" ${ex.has(t) ? '' : 'checked'} onchange="setActivityTypeCounted(${JSON.stringify(t).replace(/"/g, '&quot;')}, this.checked)"></td></tr>`).join('')}</tbody></table></div>` : '';
+  el.innerHTML = `
+    <div class="trend-status">${status}</div>
+    ${typeRows}
+    <div class="flex gap-8" style="flex-wrap:wrap;margin-top:12px;">
+      <button class="btn btn-primary btn-sm" onclick="document.getElementById('activity-file-input').click()">Load call activity file</button>
+      ${live ? '<button class="btn btn-secondary btn-sm" onclick="pullWarehouseActivity()">Pull from data warehouse</button>' : ''}
+      <button class="btn btn-secondary btn-sm" onclick="downloadActivityTemplate()">Download template</button>
+      ${a0 ? '<button class="btn btn-danger btn-sm" onclick="clearActivity()">Clear activity</button>' : ''}
+    </div>
+    <div class="form-hint" style="margin-top:10px;line-height:1.55;">Changes apply the next time you build the plan (Plan → Build plan) with a start date in the same quarter. Each doctor is planned for the calls still needed to reach goal; doctors already at goal get no calls, and doctors not reached yet get an earlier first visit and are trimmed last if the quarter runs out of slots.</div>`;
 }
 
 // ═══════════════════════════════════════════════════════════════════
@@ -8157,7 +8438,16 @@ function generateQuarter() {
       const _shift = targetWeeks[0] - 1;
       targetWeeks = targetWeeks.map(w => Math.max(1, w - _shift));
     }
-    return { ...h, qCalls: q, targetWeeks, remaining: q, lastVisitDate: null, weeksVisited: [] };
+    // v4.6: not reached yet this quarter (call activity) — first visit within the first third of the plan
+    const _act = ciqActivity(h, h.callGoal);
+    const _actUnreached = !!(_act && _act.done === 0 && q > 0);
+    const _actEarly = _actUnreached ? Math.max(1, Math.ceil(weeksN / 3)) : 0;
+    if (_actUnreached && targetWeeks.length && targetWeeks[0] > _actEarly) {
+      const _shift = targetWeeks[0] - _actEarly;
+      targetWeeks = targetWeeks.map(w => Math.max(1, w - _shift));
+    }
+    return { ...h, qCalls: q, targetWeeks, remaining: q, lastVisitDate: null, weeksVisited: [],
+             _actDone: _act ? _act.done : null, _actUnreached, _actEarly };
   });
 
   // ── AUTO FREQUENCY SCALING ──────────────────────────────────────────
@@ -8175,6 +8465,8 @@ function generateQuarter() {
   const totalSlotsCap = workDays.length * C.dailyTarget;
   const segScaleOrder = ['D','C','B','A']; // reduce lowest priority first
   const minCallsPerHCP = 1;
+  // v4.6: a doctor already reached this quarter (call activity) can be trimmed to 0 more calls
+  const _minCalls = h => (h._actDone > 0 ? 0 : minCallsPerHCP);
 
   const totalNeededNow = () => hcpPlan.filter(h=>!h.doNotCall).reduce((s,h)=>s+h.qCalls,0);
 
@@ -8183,16 +8475,17 @@ function generateQuarter() {
 
     for (const seg of segScaleOrder) {
       if (totalNeededNow() <= totalSlotsCap) break;
-      const segHCPs = hcpPlan.filter(h => !h.doNotCall && (h.segment||'?') === seg && h.qCalls > minCallsPerHCP);
+      const segHCPs = hcpPlan.filter(h => !h.doNotCall && (h.segment||'?') === seg && h.qCalls > _minCalls(h));
       if (segHCPs.length === 0) continue;
 
       // Iteratively reduce this segment's HCPs by 1 call each pass until we fit or hit minimum
       while (totalNeededNow() > totalSlotsCap) {
-        const reducible = segHCPs.filter(h => h.qCalls > minCallsPerHCP);
+        const reducible = segHCPs.filter(h => h.qCalls > _minCalls(h));
         if (reducible.length === 0) break;
         // Reduce the HCPs with the highest qCalls first (most to give);
-        // trend-flagged doctors (extra calls) are trimmed last
-        reducible.sort((a,b) => ((trendAdd(a) > 0) - (trendAdd(b) > 0)) || b.qCalls - a.qCalls);
+        // trend-flagged doctors (extra calls) are trimmed last (and doctors not reached yet)
+        const _keep = h => (trendAdd(h) > 0 || h._actUnreached) ? 1 : 0;   // v4.6: unreached also trimmed last
+        reducible.sort((a,b) => (_keep(a) - _keep(b)) || b.qCalls - a.qCalls);
         const batch = Math.min(reducible.length, totalNeededNow() - totalSlotsCap);
         for (let i = 0; i < batch && totalNeededNow() > totalSlotsCap; i++) {
           reducible[i].qCalls--;
@@ -8205,14 +8498,14 @@ function generateQuarter() {
     }
 
     const finalTotal = totalNeededNow();
-    const scaledDown = hcpPlan.filter(h => !h.doNotCall && h.qCalls < qCalls(h.callGoal));
+    const scaledDown = hcpPlan.filter(h => !h.doNotCall && h.qCalls < qCalls(h.callGoal, h));
     addLog(`[CAPACITY] After scaling: ${finalTotal} calls needed, ${totalSlotsCap} slots available — ${scaledDown.length} HCPs had frequency reduced`);
 
     // Log which HCPs were reduced and by how much
     ['A','B','C','D'].forEach(seg => {
       const reduced = scaledDown.filter(h => (h.segment||'?') === seg);
       if (reduced.length) {
-        addLog(`[CAPACITY] Seg ${seg} reductions: ` + reduced.map(h => `${h.lastName} ${qCalls(h.callGoal)}→${h.qCalls}`).join(', '));
+        addLog(`[CAPACITY] Seg ${seg} reductions: ` + reduced.map(h => `${h.lastName} ${qCalls(h.callGoal, h)}→${h.qCalls}`).join(', '));
       }
     });
   } else {
@@ -8220,6 +8513,13 @@ function generateQuarter() {
   }
 
   addLog(`[HCP] ${hcpPlan.length} HCPs | Total Q-calls after scaling: ${hcpPlan.reduce((s,h)=>s+h.qCalls,0)}`);
+  const _actPlan = hcpPlan.filter(h => !h.doNotCall && h._actDone != null);
+  if (_actPlan.length) {
+    const _asOf = (_actPlan[0].act || {}).asOf;
+    addLog(`[ACTIVITY] Calls through ${_asOf}: ${_actPlan.filter(h => h._actDone > 0).length} of ${_actPlan.length} HCPs reached so far · `
+      + `${_actPlan.filter(h => h.qCalls === 0).length} need no more calls · ${_actPlan.filter(h => h._actUnreached).length} not reached yet (first visit by week ${Math.max(1, Math.ceil(weeksN / 3))}) · `
+      + `goals = quarterly goal − calls done (replaces proration)`);
+  }
 
   // Sort ZIP4s by oneway (ascending)
   const zip4Sorted = [...STATE.zip4Travel].sort((a,b) => a.oneway - b.oneway);
@@ -8689,7 +8989,7 @@ function generateQuarter() {
       const effectivePool = filteredPool.length > 0 ? filteredPool : candidatePool;
 
       primaryZIP4 = effectivePool.reduce((best, z) => {
-        const newBoost = eligible.filter(h => h.zip4 === z.zip4 && ((week <= 2 && h.isNewHCP) || (trendEarly(h) >= week))).length * 3;
+        const newBoost = eligible.filter(h => h.zip4 === z.zip4 && ((week <= 2 && h.isNewHCP) || (trendEarly(h) >= week) || (h._actUnreached && h._actEarly >= week))).length * 3;
         const demand = (zip4Demand[String(z.zip4).replace(/\D/g,'')] || 0) + newBoost;
         const rawScore = demand / (z.oneway + 1);
         const penalty = recentZones.has(z.zip4) ? 0.30 : 1.0;
@@ -10600,7 +10900,7 @@ function generateQuarter() {
     return si(a.segment) - si(b.segment) || b.remaining - a.remaining;
   });
   // Identify HCPs whose frequency was auto-scaled down
-  const scaledHCPs = hcpPlan.filter(h => !h.doNotCall && h.qCalls < qCalls(h.callGoal));
+  const scaledHCPs = hcpPlan.filter(h => !h.doNotCall && h.qCalls < qCalls(h.callGoal, h));
   const scaledByAB = scaledHCPs.filter(h => h.segment === 'A' || h.segment === 'B').length;
   const targetWasRaised = C.dailyTarget > STATE.config.dailyTarget;
   const raisedFrom = STATE.config.dailyTarget;
@@ -10624,7 +10924,7 @@ function generateQuarter() {
           </tr></thead>
           <tbody>
             ${unmetSorted.map((h,i) => {
-              const origGoal = qCalls(h.callGoal);
+              const origGoal = qCalls(h.callGoal, h);
               const adjGoal  = h.qCalls;
               const planned  = h.qCalls - h.remaining;
               const pct      = adjGoal > 0 ? Math.round(planned / adjGoal * 100) : 0;
@@ -12876,7 +13176,7 @@ function exportExcel() {
 
   // HCP sheet
   const hcpData = [['NPI','FirstName','LastName','Address','City','State','Zip5','Zip4','Segment','CallGoal','Planned_Calls']];
-  STATE.hcps.forEach(h => hcpData.push([h.npi,h.firstName,h.lastName,h.address,h.city,h.state,h.zip5,h.zip4,h.segment,h.callGoal,qCalls(h.callGoal)]));
+  STATE.hcps.forEach(h => hcpData.push([h.npi,h.firstName,h.lastName,h.address,h.city,h.state,h.zip5,h.zip4,h.segment,h.callGoal,qCalls(h.callGoal, h)]));
   XLSX.utils.book_append_sheet(wb, XLSX.utils.aoa_to_sheet(hcpData), 'HCP_Master');
 
   // ZIP4 sheet
@@ -15480,8 +15780,11 @@ function openReachFreqReport() {
     .filter(h => !h.doNotCall)
     .map(h => {
       const key       = h.npi || `${h.firstName} ${h.lastName}`;
-      const origGoal  = qCalls(h.callGoal || 4, h);   // quarterly goal — same formula the generator uses
-      const planned   = callsByNpi[key] || 0;
+      // v4.6: with call activity, calls done this quarter + planned count against the full goal
+      const act       = ciqActivity(h, h.callGoal || 4);
+      const done      = act ? act.done : 0;
+      const origGoal  = act ? act.goal : qCalls(h.callGoal || 4, h);   // quarterly goal — same formula the generator uses
+      const planned   = done + (callsByNpi[key] || 0);
       // Detect if engine auto-scaled: if planned < origGoal but plan has no remaining unscheduled
       // We approximate: actual adjusted goal = max(planned, 1) if planned < origGoal and HCP was reached
       // Best signal: use origGoal as the target; scaling shows up as planned < origGoal being OK
@@ -15492,7 +15795,7 @@ function openReachFreqReport() {
       const meals     = (h.scheduledLunches || []).length;
       // Was frequency scaled? planned > 0 but below original goal — flag for display
       const wasScaled = reached && planned < origGoal;
-      return { h, key, goal, origGoal, planned, reached, pct, dates, meals, wasScaled,
+      return { h, key, goal, origGoal, planned, done, reached, pct, dates, meals, wasScaled,
                seg: h.segment || '—', name: `${h.lastName}, ${h.firstName}` };
     })
     .sort((a, b) => {
@@ -15501,6 +15804,7 @@ function openReachFreqReport() {
     });
 
   const totalHCPs    = hcpRows.length;
+  const rfAct        = hcpRows.some(r => r.done > 0);   // v4.6: call activity loaded
   const reachedCount = hcpRows.filter(r => r.reached).length;
   const scaledCount  = hcpRows.filter(r => r.wasScaled).length;
   const totalGoal    = hcpRows.reduce((s, r) => s + r.goal, 0);
@@ -15573,7 +15877,7 @@ function openReachFreqReport() {
       : `${r.goal}`;
     return `<tr style="background:${rowBg};">
       <td style="padding:7px 10px;font-size:11px;color:#888;">${r.h.npi||'—'}</td>
-      <td style="padding:7px 10px;font-weight:600;font-size:13px;">${r.name}${mealBadge}${scaleBadge}</td>
+      <td style="padding:7px 10px;font-weight:600;font-size:13px;">${r.name}${mealBadge}${scaleBadge}${r.done ? `<span style="font-size:10px;background:#dcfce7;color:#166534;padding:1px 6px;border-radius:8px;margin-left:4px;" title="Completed calls this quarter (call activity)">✓ ${r.done} done</span>` : ''}</td>
       <td style="padding:7px 10px;">${r.h.city||'—'}</td>
       <td style="padding:7px 10px;text-align:center;">
         <span style="padding:2px 8px;border-radius:10px;font-size:11px;font-weight:700;background:${segBg[r.seg]||'#f4f7fb'};color:${segColors[r.seg]||'#333'};">${r.seg}</span>
@@ -15747,7 +16051,7 @@ function openReachFreqReport() {
     <table class="hcp-table">
       <thead><tr>
         <th>NPI</th><th>Name</th><th>City</th><th style="text-align:center;">Seg</th>
-        <th style="text-align:center;">Planned</th><th style="text-align:center;">Goal</th>
+        <th style="text-align:center;">${rfAct ? 'Done + planned' : 'Planned'}</th><th style="text-align:center;">Goal</th>
         <th style="min-width:130px;">Attainment</th><th>Status</th><th>Scheduled Dates</th>
       </tr></thead>
       <tbody>${hcpDetailRows}</tbody>
@@ -18087,6 +18391,7 @@ const _ADMIN_PW_KEY  = 'tiq_admin_pw';
       page.insertBefore(bar, page.firstChild);
     }
     if (id === 'config' && typeof renderTrendCard === 'function') renderTrendCard();
+    if (id === 'config' && typeof renderActivityCard === 'function') renderActivityCard();
     if (id === 'config' && typeof refreshRepSettings === 'function') refreshRepSettings();
     if (typeof window._ciqTabSync === 'function') window._ciqTabSync(group, id);
     if (id === 'planner' && typeof window._bpPrefill === 'function') window._bpPrefill();

@@ -1,0 +1,56 @@
+# CompassIQ
+
+Territory routing planner for field sales reps.
+
+| File | What it is |
+|---|---|
+| `CompassIQ_ADMIN.html` | Admin tool. Loads HCP data, trends and call activity, and publishes the rep (field) file. A copy of the field app is embedded in it as base64 (`<script type="text/plain" id="ciq-field-template">`), so any change to shared app code must also be made in that embedded copy. |
+| `CompassIQ_Field_DEMO.html` | Field app with demo data, for sales demos. |
+
+## Call activity (v4.6)
+
+Completed calls from the data warehouse drive mid-quarter planning. Load them under
+**Settings → Call activity**, in step 3 of the admin console, or pull them live.
+
+### File format
+
+Use one row per call (recommended):
+
+| Column | Required | Notes |
+|---|---|---|
+| `NPI` | yes | |
+| `Call_Date` | yes | `YYYY-MM-DD`, `M/D/YYYY` or an Excel date |
+| `Call_Type` | no | Each type can be switched on or off as "counts toward goal" in the card |
+| `Status` | no | Rows marked planned, scheduled, cancelled, deleted, draft, saved, pending, missed, declined, void, not submitted or open are skipped |
+
+Or use one row per doctor: `NPI`, `Calls_QTD`, and optionally `As_Of`.
+
+Rules:
+- Column names are matched loosely, so `Call Date`, `call_date` and `CALLDATE` all work.
+- A doctor counts at most one call per day.
+- Only calls in the quarter of the latest call date ("as of") are counted.
+
+### How planning uses it
+
+When a plan starts in the same quarter as the activity:
+- **Calls planned per doctor** = quarterly goal + trend extras − completed calls (never below 0). This replaces prorating goals by the share of the quarter left.
+- **Doctors already at goal** get no calls.
+- **Doctors not reached yet** get their first visit within the first third of the plan, add weight to their area early on, and are trimmed last when capacity runs short.
+- **Doctors already reached** can be trimmed to 0 more calls when capacity runs short.
+- **The R&F report** shows "Done + planned" against the full quarterly goal.
+
+Activity is stored on each HCP record (`h.act`), the same way trends are, so it carries through publishing to reps.
+
+### Live pull API (for the cloud backend)
+
+The **Pull from data warehouse** button only appears when the app is opened from a web address. It calls:
+
+```
+GET /api/activity?from=YYYY-MM-DD[&territory=<territory name>]     (same-origin cookie auth)
+→ 200 { "asOf": "YYYY-MM-DD", "calls": [ { "npi": "...", "date": "YYYY-MM-DD", "type": "...", "status": "..." } ] }
+```
+
+Field builds send their territory; the admin build pulls all territories. The server must
+only return calls for territories the signed-in user may see. If the server returns 404, the
+app tells the user live sync isn't set up and to load a file instead. If it returns 401 or 403,
+the app asks them to sign in.
