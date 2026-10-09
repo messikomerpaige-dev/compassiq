@@ -3113,9 +3113,13 @@
         </div>
         <hr class="divider" style="margin:4px 0;">
         <div class="form-group">
-          <label class="form-label" style="font-size:13px;font-weight:600;color:var(--text);">🛣 Real Drive Times <span style="font-size:11px;font-weight:400;color:var(--text3);margin-left:6px;">via OSRM · free · no API key</span></label>
+          <label class="form-label" style="font-size:13px;font-weight:600;color:var(--text);">🛣 Real Drive Times <span style="font-size:11px;font-weight:400;color:var(--text3);margin-left:6px;">via OSRM</span></label>
           <div style="font-size:12px;color:var(--text2);margin-bottom:10px;line-height:1.6;">
-            Computes actual road-network drive times between all HCP ZIP codes. Auto-runs when you load HCPs or change your home ZIP. Results are cached locally and used during quarter generation instead of straight-line estimates.
+            Computes actual road-network drive times between all HCP ZIP codes. Auto-runs when you load HCPs or change your home ZIP. Results are cached locally and used during quarter generation — for day timing and for the order of each day's stops — instead of straight-line estimates.
+          </div>
+          <div style="display:flex;align-items:center;gap:8px;flex-wrap:wrap;margin-bottom:10px;">
+            <input type="url" class="form-input" id="cfg-routing-server" placeholder="https://router.project-osrm.org" style="max-width:320px;" onchange="setRoutingServer(this.value)">
+            <span class="form-hint" style="margin:0;">Routing server (OSRM-compatible). Leave blank for the free public server, which is for testing only — use your own or a commercial one for clients.</span>
           </div>
           <div style="display:flex;align-items:center;gap:10px;flex-wrap:wrap;">
             <button class="btn btn-secondary btn-sm" id="rdt-compute-btn" onclick="computeRealDriveTimes()">📡 Compute Drive Times Now</button>
@@ -7553,6 +7557,7 @@ function renderConfig() {
   document.getElementById('cfg-switch-pen').value = c.switchPenalty;
   document.getElementById('cfg-intra-default').value = c.intraDefault;
   const _lrEl = document.getElementById('cfg-lunch-radius'); if (_lrEl) _lrEl.value = c.lunchRadius || 15;
+  const _rsEl = document.getElementById('cfg-routing-server'); if (_rsEl) _rsEl.value = c.routingServer || '';
   // Break time
   const _beEl = document.getElementById('cfg-break-enabled'); if (_beEl) _beEl.checked = !!c.breakEnabled;
   const _bsEl = document.getElementById('cfg-break-start');   if (_bsEl) _bsEl.value = c.breakStart || '13:00';
@@ -7658,6 +7663,48 @@ function clearDriveMatrix() {
   showToast('✓ Drive time matrix cleared');
 }
 
+// ── v4.6: ROAD MINUTES FOR STOP ORDERING ──────────────────────────────────
+// With a cached drive matrix, each day's stop order is optimised on road
+// minutes between ZIPs instead of straight-line miles. Pairs the matrix
+// lacks use the tiered road estimate; stops in the same ZIP keep their
+// small spacing so they still order sensibly.
+function _ciqRoadOn() {
+  const m = STATE.driveMatrix;
+  if (!m) return false;
+  for (const k in m) return true;
+  return false;
+}
+// ZIP whose centroid is at this coordinate (home, hotel or a stop), if known
+function _ciqZipAtCoord(c, candidates) {
+  if (!c) return null;
+  const at = z => { const zc = z && ZIP_COORDS[z]; return zc && Math.abs(zc[0] - c[0]) < 1e-4 && Math.abs(zc[1] - c[1]) < 1e-4; };
+  const home = ((STATE.config.homeAddress || '').match(/\b(\d{5})\b/) || [])[1];
+  if (at(home)) return home;
+  return (candidates || []).find(at) || null;
+}
+// Road minutes between two stops (ZIP + coordinate each)
+function _ciqLegMin(za, ca, zb, cb) {
+  if (za && zb && za === zb) return (ca && cb) ? haversineMiles(ca[0], ca[1], cb[0], cb[1]) * 2.3 : 1;
+  const m = STATE.driveMatrix || {};
+  const v = (za && zb) ? (m[za + ':' + zb] !== undefined ? m[za + ':' + zb] : m[zb + ':' + za]) : undefined;
+  if (v !== undefined) return v;
+  if (!ca || !cb) return 999;
+  const mi = haversineMiles(ca[0], ca[1], cb[0], cb[1]);
+  const rf = mi > 80 ? 1.15 : mi > 30 ? 1.25 : 1.35, sp = mi > 80 ? 65 : mi > 30 ? 55 : 35;
+  return mi * rf / sp * 60;
+}
+// OSRM-compatible routing server (Settings → Real Drive Times)
+const CIQ_DEFAULT_ROUTING_SERVER = 'https://router.project-osrm.org';
+function _ciqRoutingBase() {
+  const s = String((STATE.config && STATE.config.routingServer) || '').trim().replace(/\/+$/, '');
+  return /^https?:\/\//.test(s) ? s : CIQ_DEFAULT_ROUTING_SERVER;
+}
+function setRoutingServer(v) {
+  STATE.config.routingServer = String(v || '').trim();
+  saveState();
+  showToast(STATE.config.routingServer ? '✓ Routing server saved — click Compute Drive Times Now' : '✓ Using the public OSRM server');
+}
+
 // ── CORE LOOKUP: real road minutes between two zip5s ───────────────────────
 // Returns cached real drive time if available, otherwise falls back to haversine estimate.
 function realDriveMin(zip5a, zip5b) {
@@ -7695,7 +7742,7 @@ async function fetchOSRMMatrix(coords) {
       const dstIdx = cj === ci
         ? srcs.map((_, i) => i).join(';')
         : [...srcs.map((_, i) => i), ...dsts.map((_, i) => i + srcs.length)].join(';');
-      const url = `https://router.project-osrm.org/table/v1/driving/${coordStr}?sources=${srcIdx}&destinations=${dstIdx}&annotations=duration`;
+      const url = `${_ciqRoutingBase()}/table/v1/driving/${coordStr}?sources=${srcIdx}&destinations=${dstIdx}&annotations=duration`;
       try {
         const r = await fetch(url);
         if (!r.ok) throw new Error('OSRM error ' + r.status);
@@ -9533,14 +9580,20 @@ function generateQuarter() {
       if (hcps.length <= 1) return hcps;
       if (hcps.length === 2) return hcps;
       const coord = (h) => _hcpCoordMap.get(h) || null;
+      // v4.6: with a cached drive matrix, every cost below is road minutes instead of miles
+      const _road = _ciqRoadOn();
+      const _zipOf = (h) => String(_hcpDayLoc(h, wdName).zip5 || h.zip5 || '').replace(/\D/g,'').padStart(5,'0').slice(0,5);
+      const _startZip = _road ? _ciqZipAtCoord(startCoord, hcps.map(_zipOf)) : null;
 
       // Edge distance between two HCPs (or from startCoord to first)
       const edgeDist = (a, b) => {
         const ca = coord(a), cb = coord(b);
+        if (_road) return _ciqLegMin(_zipOf(a), ca, _zipOf(b), cb);
         return (ca && cb) ? haversineMiles(ca[0], ca[1], cb[0], cb[1]) : 999;
       };
       const homeDist = (h) => {
         const c = coord(h), s = startCoord;
+        if (_road) return s ? _ciqLegMin(_startZip, s, _zipOf(h), c) : 0;
         return (s && c) ? haversineMiles(s[0], s[1], c[0], c[1]) : 0;
       };
 
@@ -9548,10 +9601,7 @@ function generateQuarter() {
         let d = homeDist(route[0]);
         for (let i = 0; i < route.length - 1; i++) d += edgeDist(route[i], route[i+1]);
         // 10% return-home nudge — just enough to break ties, not enough to cause backtracking
-        if (startCoord && route.length > 0) {
-          const lc = coord(route[route.length-1]);
-          if (lc) d += haversineMiles(lc[0], lc[1], startCoord[0], startCoord[1]) * 0.10;
-        }
+        if (startCoord && route.length > 0) d += homeDist(route[route.length-1]) * 0.10;
         return d;
       };
 
@@ -9566,10 +9616,7 @@ function generateQuarter() {
         );
         const H = hcps.map(h => homeDist(h));
         // Return-home penalty per node (10% — tiebreaker only, not dominant factor)
-        const R = hcps.map(h => {
-          const c = coord(h), s = startCoord;
-          return (s && c) ? haversineMiles(c[0], c[1], s[0], s[1]) * 0.10 : 0;
-        });
+        const R = hcps.map(h => homeDist(h) * 0.10);
 
         const INF = 1e15;
         const FULL = (1 << n) - 1;
@@ -9615,7 +9662,7 @@ function generateQuarter() {
           mask ^= (1 << cur);
           cur = prev;
         }
-        addLog(`[EXACT ${date}] Held-Karp optimal route for ${n} stops`);
+        addLog(`[EXACT ${date}] Held-Karp optimal route for ${n} stops${_road ? ' · road drive times' : ''}`);
         return path;
       }
 
@@ -9628,16 +9675,16 @@ function generateQuarter() {
         const first = hcps[startIdx];
         let remaining = hcps.filter((_, k) => k !== startIdx);
         const candidate = [first];
-        let cur = coord(first);
+        let cur = coord(first), prevNode = first;
         while (remaining.length > 0) {
           let bestI = 0, bestD = Infinity;
           remaining.forEach((h, i) => {
             const c = coord(h);
-            const d = (cur && c) ? haversineMiles(cur[0], cur[1], c[0], c[1]) : 999;
+            const d = _road ? edgeDist(prevNode, h) : (cur && c) ? haversineMiles(cur[0], cur[1], c[0], c[1]) : 999;
             if (d < bestD) { bestD = d; bestI = i; }
           });
           const picked = remaining.splice(bestI, 1)[0];
-          cur = coord(picked) || cur;
+          cur = coord(picked) || cur; prevNode = picked;
           candidate.push(picked);
         }
         const d = segDist(candidate);
@@ -10377,7 +10424,12 @@ function generateQuarter() {
       const originCoord = hotelCoord || homeCoordMU;
 
       const getC = (v) => ZIP_COORDS[String(v.zip5||'').replace(/\D/g,'').padStart(5,'0').slice(0,5)] || null;
+      const getZ = (v) => String(v.zip5||'').replace(/\D/g,'').padStart(5,'0').slice(0,5);
       const cdist = (a, b) => (a && b) ? haversineMiles(a[0],a[1],b[0],b[1]) : 50;
+      // v4.6: blocks/origin are { coord, zip }; road minutes when a drive matrix is cached
+      const _roadMU = _ciqRoadOn();
+      const bdist = (a, b) => (_roadMU && a && b) ? _ciqLegMin(a.zip, a.coord, b.zip, b.coord) : cdist(a && a.coord, b && b.coord);
+      const originZip = morningHotel ? String(morningHotel.zip5) : (homeZipMU ? homeZipMU[1] : null);
 
       // Group stops by officeKey so co-located HCPs stay adjacent
       const seenKeys = [];
@@ -10389,7 +10441,7 @@ function generateQuarter() {
       }
       const blocks = seenKeys.map(key => ({
         key, visits: officeGroups[key],
-        coord: getC(officeGroups[key][0]),
+        coord: getC(officeGroups[key][0]), zip: getZ(officeGroups[key][0]),
       }));
 
       // Helper: resolve lunchTime, falling back to HCP scheduledLunches for older plans
@@ -10415,24 +10467,20 @@ function generateQuarter() {
       // Helper: optimize a subset of blocks with NN + 2-opt
       const optimizeBlocks = (blks, origin) => {
         if (blks.length <= 1) return blks;
-        let best = blks.slice(), bestDist = (() => {
-          let d = cdist(origin, blks[0].coord);
-          for (let i = 0; i < blks.length - 1; i++) d += cdist(blks[i].coord, blks[i+1].coord);
-          return d;
-        })();
         const rDist = (order) => {
-          let d = cdist(origin, order[0].coord);
-          for (let i = 0; i < order.length - 1; i++) d += cdist(order[i].coord, order[i+1].coord);
+          let d = bdist(origin, order[0]);
+          for (let i = 0; i < order.length - 1; i++) d += bdist(order[i], order[i+1]);
           return d;
         };
+        let best = blks.slice(), bestDist = rDist(blks);
         for (let si = 0; si < blks.length; si++) {
           const rem = blks.filter((_,k) => k !== si);
           const cand = [blks[si]];
-          let cur = blks[si].coord;
+          let cur = blks[si];
           while (rem.length) {
             let bi = 0, bd = Infinity;
-            rem.forEach((b,i) => { const d = cdist(cur,b.coord); if(d<bd){bd=d;bi=i;} });
-            const picked = rem.splice(bi,1)[0]; cand.push(picked); cur = picked.coord||cur;
+            rem.forEach((b,i) => { const d = bdist(cur,b); if(d<bd){bd=d;bi=i;} });
+            const picked = rem.splice(bi,1)[0]; cand.push(picked); cur = (_roadMU || picked.coord) ? picked : cur;
           }
           const d = rDist(cand);
           if (d < bestDist - 0.01) { bestDist = d; best = cand; }
@@ -10456,13 +10504,13 @@ function generateQuarter() {
         const mealIdxSet = new Set(mealBlockInfos.map(m => m.idx));
         const parts = [];
         let segBlocks = [];
-        let prevCoord = originCoord;
+        let prevCoord = { coord: originCoord, zip: originZip };
         for (let bi = 0; bi < blocks.length; bi++) {
           if (mealIdxSet.has(bi)) {
             const optSeg = optimizeBlocks(segBlocks, prevCoord);
             parts.push(...optSeg.flatMap(blk => blk.visits));
             parts.push(...blocks[bi].visits);
-            prevCoord = blocks[bi].coord || prevCoord;
+            prevCoord = blocks[bi].coord ? blocks[bi] : prevCoord;
             segBlocks = [];
           } else {
             segBlocks.push(blocks[bi]);
@@ -10472,20 +10520,22 @@ function generateQuarter() {
         parts.push(...optTail.flatMap(blk => blk.visits));
         reordered = parts;
       } else {
-        reordered = optimizeBlocks(blocks, originCoord).flatMap(blk => blk.visits);
+        reordered = optimizeBlocks(blocks, { coord: originCoord, zip: originZip }).flatMap(blk => blk.visits);
       }
 
       // Reassign times, hard-pinning meals/appointments
       let curMin = parseTime(C.workdayStart);
       const firstC = getC(reordered[0]);
-      if (firstC && originCoord) curMin += milesToMin(haversineMiles(originCoord[0],originCoord[1],firstC[0],firstC[1]));
+      if (firstC && originCoord) curMin += Math.max(milesToMin(haversineMiles(originCoord[0],originCoord[1],firstC[0],firstC[1])),
+        (_roadMU && originZip) ? realDriveMin(originZip, getZ(reordered[0])) : 0);
       reordered.forEach((v, i) => {
         if (i > 0) {
           const prev = reordered[i-1];
           const pk = prev.hcpRef?._officeKey, tk = v.hcpRef?._officeKey;
           const sameOffice = pk && tk && !pk.startsWith('__') && pk === tk;
           const pc = getC(prev), tc = getC(v);
-          const travelMin = sameOffice ? 0 : ((pc&&tc) ? milesToMin(haversineMiles(pc[0],pc[1],tc[0],tc[1])) : (C.intraDefault||20));
+          const travelMin = sameOffice ? 0 : ((pc&&tc) ? Math.max(milesToMin(haversineMiles(pc[0],pc[1],tc[0],tc[1])),
+            _roadMU ? realDriveMin(getZ(prev), getZ(v)) : 0) : (C.intraDefault||20));
           curMin += travelMin;
           v.travelMin = travelMin;
         }
@@ -10500,7 +10550,7 @@ function generateQuarter() {
         v.callNum = i + 1;
       });
     }
-    if (mopupDates.length > 0) addLog(`[RESEQ] Post-mop-up resequence (NN+2-opt) applied to ${mopupDates.length} day(s)`);
+    if (mopupDates.length > 0) addLog(`[RESEQ] Post-mop-up resequence (NN+2-opt${_ciqRoadOn() ? ', road drive times' : ''}) applied to ${mopupDates.length} day(s)`);
   })();
   // ── END POST-MOP-UP RESEQUENCE ─────────────────────────────────────────────
 

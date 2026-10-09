@@ -54,3 +54,18 @@ Field builds send their territory; the admin build pulls all territories. The se
 only return calls for territories the signed-in user may see. If the server returns 404, the
 app tells the user live sync isn't set up and to load a file instead. If it returns 401 or 403,
 the app asks them to sign in.
+
+## Road drive times for stop order (v4.6)
+
+When road drive times are cached (**Settings → Real Drive Times**), each day's stops are put in
+order using road minutes between ZIP codes instead of straight-line miles. This applies to the
+main route optimizer (Held-Karp for up to 11 stops; nearest-neighbor + 2-opt + Or-opt above
+that) and to the re-sequencing pass after mop-up.
+
+- Any ZIP pair missing from the cache uses the existing tiered road estimate.
+- Stops in the same ZIP keep their small spacing so they still order sensibly.
+- With no cache, plans are identical to v4.5.
+
+**Routing server:** The **Routing server** field sets the OSRM-compatible server used to fetch
+drive times. Leave it blank to use the free public server (`router.project-osrm.org`), which is
+for testing only. Clients need your own OSRM server or a commercial OSRM-compatible one.
