@@ -6,7 +6,7 @@ import assert from 'node:assert/strict';
 import { readFileSync } from 'node:fs';
 import { PGlite } from '@electric-sql/pglite';
 
-const MIGRATION = readFileSync(new URL('../supabase/migrations/20261009000000_init.sql', import.meta.url), 'utf8');
+import { MIGRATIONS as MIGRATION } from './helpers/migrations.mjs';
 
 const AUTH_STUB = `
   create role anon nologin; create role authenticated nologin; create role service_role nologin bypassrls;

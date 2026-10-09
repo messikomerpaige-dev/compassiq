@@ -13,6 +13,9 @@ and Vercel settings screens described below.
 2. Go to **SQL Editor → New query**.
 3. Open [`supabase/migrations/20261009000000_init.sql`](supabase/migrations/20261009000000_init.sql)
    on GitHub, copy all of it into the editor, and select **Run**. It should finish with "Success. No rows returned".
+4. Do the same with each newer file in [`supabase/migrations/`](supabase/migrations/), oldest first.
+   The file names start with the date, e.g. `20261010000000_phase2_shared_data.sql`. Run each file
+   once. When a new one is added later, run just that one.
 
 ## 2. Supabase: login settings
 

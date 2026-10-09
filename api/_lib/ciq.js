@@ -56,6 +56,15 @@ export function setSessionCookies(req, res, session) {
     cookie(req, RT, session.refresh_token, REFRESH_MAX_AGE),
   ]);
 }
+// Which saved plan this browser already has (so the app isn't sent it again on every open)
+export function setStateCookie(req, res, userId, at) {
+  appendCookies(res, [cookie(req, 'ciq_state', userId + '|' + new Date(at).toISOString(), REFRESH_MAX_AGE)]);
+}
+export function stateCookie(req, userId) {
+  const v = parseCookies(req).ciq_state || '';
+  const [uid, at] = v.split('|');
+  return uid === userId && at ? at : null;
+}
 export function clearSessionCookies(req, res) {
   appendCookies(res, [cookie(req, AT, '', 0), cookie(req, RT, '', 0)]);
 }
@@ -102,6 +111,7 @@ export async function rpc(db, fn, args) {
 function dbError(error) {
   const code = error.code || '';
   const status = code === '42501' ? 403 : code === 'P0002' ? 404 : code === '23505' ? 409 : code === '22023' ? 400 : 500;
+  if (status === 500) console.error('[db]', code, error.message);   // details stay in the server log
   return httpError(status, status === 500 ? 'Database error' : error.message);
 }
 

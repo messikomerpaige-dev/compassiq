@@ -298,6 +298,77 @@ test('a manager gets their territories; signed-out visitors are sent to sign in'
   await anon.waitForURL(/\/\?next=\/admin$/);
 });
 
+test('Phase 2: a rep’s edits are shared, and their plan follows them to a new iPad and a new territory', async () => {
+  const ipad1 = await newPage();
+  await ipad1.clock.install({ time: new Date('2026-10-14T09:00:00') });
+  await signIn(ipad1, 'rep1@acme.test', 'rep1-password-1', '/app');
+  await ipad1.waitForFunction(() => document.getElementById('ob') && document.getElementById('ob').classList.contains('show'), null, { timeout: 60000 });
+  await ipad1.fill('#ob-zip', '19103');
+  await ipad1.click('#ob-go');
+  await ipad1.waitForFunction(() => STATE.hcps.length === 30 && window.CIQSync && CIQSync.status().enabled, null, { timeout: 30000 });
+  // Correct one doctor's address and mark another do-not-call, through the doctor screen
+  for (const [npi, edit] of [['1000000125', 'address'], ['1000000126', 'dnc']]) {
+    await ipad1.evaluate((npi) => openHCPPrefs(STATE.hcps.findIndex((h) => h.npi === npi)), npi);
+    if (edit === 'address') {
+      await ipad1.fill('#hcp-addr', '9 New St'); await ipad1.fill('#hcp-city', 'Allentown');
+      await ipad1.fill('#hcp-state', 'pa'); await ipad1.fill('#hcp-zip', '18104');
+    } else {
+      await ipad1.evaluate(() => document.querySelector('[data-hp="flags"]').click());
+      await ipad1.check('#hcp-dnc');
+    }
+    await ipad1.evaluate((npi) => saveHCPPrefs(STATE.hcps.findIndex((h) => h.npi === npi)), npi);
+  }
+  const fixed = await ipad1.evaluate(() => STATE.hcps.find((h) => h.npi === '1000000125'));
+  assert.deepEqual([fixed.address, fixed.city, fixed.state, fixed.zip5, fixed.zip4, fixed.addrEdited], ['9 New St', 'Allentown', 'PA', '18104', '18104', true]);
+  // Build a plan and log a visit, then let both syncs run
+  await ipad1.evaluate(() => { document.getElementById('plan-start-date').value = '2026-10-12'; generateQuarter();
+    const v = STATE.plan.find((x) => !x.isLunch && x.npi); setOutcome(v, 'done', ''); });
+  const planSize = await ipad1.evaluate(() => STATE.plan.length);
+  await ipad1.evaluate(() => { CIQSync.scan(); CIQSync.flush(); CIQState.upload(); });
+  await ipad1.waitForFunction(() => CIQSync.status().pending === 0 && localStorage.getItem('ciq_state_at'), null, { timeout: 30000 });
+  const db = (await fake.db.query(`select (select count(*)::int from public.hcp_prefs) prefs, (select count(*)::int from public.visit_outcomes) outcomes,
+    (select count(*)::int from public.rep_state) states`)).rows[0];
+  assert.deepEqual(db, { prefs: 2, outcomes: 1, states: 1 });
+
+  // The manager sees the corrected address and do-not-call
+  const mgr = await newPage();
+  await signIn(mgr, 'mgr@acme.test', 'mgr-password-1', '/app');
+  await mgr.waitForFunction(() => typeof ALL_HCPS !== 'undefined' && ALL_HCPS.length, null, { timeout: 60000 });
+  assert.deepEqual(await mgr.evaluate(() => { const a = ALL_HCPS.find((h) => h.npi === '1000000125'), b = ALL_HCPS.find((h) => h.npi === '1000000126');
+    return [a.address, a.zip5, b.doNotCall]; }), ['9 New St', '18104', true]);
+
+  // A new iPad: the plan, the address fix and do-not-call are all there, no welcome screen
+  const ipad2 = await newPage();
+  await ipad2.clock.install({ time: new Date('2026-10-14T10:00:00') });
+  await signIn(ipad2, 'rep1@acme.test', 'rep1-password-1', '/app');
+  await ipad2.waitForFunction(() => typeof STATE !== 'undefined' && document.querySelector('.ciq-acct'), null, { timeout: 60000 });
+  await ipad2.waitForTimeout(800);
+  const restored = await ipad2.evaluate(() => ({ terr: (TERRITORIES[ACTIVE_TERRITORY_ID] || {}).name, plan: STATE.plan.length,
+    addr: (STATE.hcps.find((h) => h.npi === '1000000125') || {}).address, dnc: !!(STATE.hcps.find((h) => h.npi === '1000000126') || {}).doNotCall,
+    welcome: document.getElementById('ob').classList.contains('show') }));
+  assert.deepEqual(restored, { terr: 'North', plan: planSize, addr: '9 New St', dnc: true, welcome: false });
+
+  // The owner moves the rep to South: the app asks to switch, with South picked
+  const owner = await newPage();
+  await signIn(owner, 'owner@acme.test', 'owner-password-1', '/admin');
+  const move = (to) => owner.evaluate(async ([to, uid]) => {
+    const ov = await (await fetch('/api/admin')).json();
+    const t = ov.territories.find((x) => x.name === to).id;
+    return (await fetch('/api/admin', { method: 'POST', headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ action: 'update', user_id: uid, territory_ids: [t] }) })).status;
+  }, [to, ids['rep1@acme.test']]);
+  assert.equal(await move('South'), 200);
+  await ipad2.reload();
+  await ipad2.waitForFunction(() => document.getElementById('ob') && document.getElementById('ob').classList.contains('show'), null, { timeout: 60000 });
+  assert.equal(await ipad2.inputValue('#ob-terr'), 'South');
+  assert.match(await ipad2.textContent('#ob-lead'), /moved you to South/);
+  await ipad2.fill('#ob-zip', '19087');
+  await ipad2.click('#ob-go');
+  await ipad2.waitForFunction(() => STATE.hcps.length === 12 && (TERRITORIES[ACTIVE_TERRITORY_ID] || {}).name === 'South', null, { timeout: 30000 });
+  assert.equal(await move('North'), 200);                                       // put things back for later tests
+  assert.deepEqual(ipad1.errors.concat(mgr.errors, ipad2.errors, owner.errors), []);
+});
+
 test('turning a rep off locks them out and erases the app data on their device', async () => {
   const rep = await newPage();
   await signIn(rep, 'rep2@acme.test', 'rep2-password-1', '/app');

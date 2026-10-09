@@ -8,9 +8,13 @@ import session from '../../api/session.js';
 import admin from '../../api/admin.js';
 import platform from '../../api/platform.js';
 import appData from '../../api/app-data.js';
+import ping from '../../api/ping.js';
+import sync from '../../api/sync.js';
+import prefs from '../../api/prefs.js';
+import state from '../../api/state.js';
 
 const PUBLIC = fileURLToPath(new URL('../../public/', import.meta.url));
-const API = { session, admin, platform, 'app-data': appData };
+const API = { session, admin, platform, 'app-data': appData, ping, sync, prefs, state };
 const TYPES = { '.html': 'text/html; charset=utf-8', '.js': 'application/javascript', '.css': 'text/css', '.json': 'application/json' };
 
 async function fileFor(path) {

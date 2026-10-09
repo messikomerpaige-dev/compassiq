@@ -5,9 +5,9 @@
 // more remain, writes the script tag for the next page, so the browser loads them in order before
 // the app's own code runs. Only the signed-in person's territories come back (row level security).
 //
-// Page 0 also sets window.__CIQ_CLOUD (who is signed in) and erases this browser's CompassIQ data
-// if a different person used it last. Signed out → sign-in page; cut off → /blocked.
-import { handler, requireAccess, rpc } from './_lib/ciq.js';
+// Page 0 also sets window.__CIQ_CLOUD (who is signed in), erases this browser's CompassIQ data
+// if a different person used it last, and restores the person's saved plan when it is newer. Signed out → sign-in page; cut off → /blocked.
+import { handler, requireAccess, rpc, stateCookie, setStateCookie } from './_lib/ciq.js';
 
 const PAGE = 2000;
 const WIPE = `function(){try{[localStorage,sessionStorage].forEach(function(s){Object.keys(s).forEach(function(k){if(/^(tiq_|ciq_)/.test(k))s.removeItem(k)})})}catch(e){}}`;
@@ -49,6 +49,15 @@ export default handler(async (req, res) => {
     code += `window.__CIQ_CLOUD=${JSON.stringify(cloud)};`
       + `(function(){var w=${WIPE};try{if(localStorage.getItem('ciq_owner')!==${JSON.stringify(session.user.id)}){w();localStorage.setItem('ciq_owner',${JSON.stringify(session.user.id)})}}catch(e){}})();`
       + `window.__CIQ_DATA=[];`;
+    // This person's saved plan and settings: restored before the app starts when this browser
+    // doesn't have the latest copy (new iPad, cleared data, or saved from another device)
+    const saved = await rpc(db, 'ciq_my_state', { p_since: stateCookie(req, session.user.id) });
+    if (saved && saved.data && saved.data.T && JSON.stringify(saved.data).length < 3e6) {
+      code += `(function(){try{var s=${JSON.stringify({ at: saved.at, data: saved.data })};`
+        + `localStorage.setItem('tiq_territories',JSON.stringify(s.data.T));if(s.data.A)localStorage.setItem('tiq_active',s.data.A);`
+        + `localStorage.setItem('ciq_welcome_seen','1');localStorage.setItem('ciq_state_at',s.at)}catch(e){}})();`;
+    }
+    if (saved && saved.at) setStateCookie(req, res, session.user.id, saved.at);
   }
   code += `window.__CIQ_DATA=window.__CIQ_DATA.concat(${JSON.stringify(data)});`;
   if (data.length === PAGE) code += `document.write('<script src="/api/app-data?page=${page + 1}"><\\/script>');`;

@@ -4,7 +4,7 @@
 import { readFileSync } from 'node:fs';
 import { PGlite } from '@electric-sql/pglite';
 
-const MIGRATION = readFileSync(new URL('../../supabase/migrations/20261009000000_init.sql', import.meta.url), 'utf8');
+import { MIGRATIONS as MIGRATION } from './migrations.mjs';
 const AUTH_STUB = `
   create role anon nologin; create role authenticated nologin; create role service_role nologin bypassrls;
   create schema auth;
@@ -59,7 +59,7 @@ export async function createFakeSupabase() {
     const call = `public.${fn}(${names.map((k, i) => `${k} => $${i + 1}`).join(', ')})`;
     const params = names.map((k) => {
       const v = args[k];
-      if (Array.isArray(v) && fn !== 'ciq_publish_rows') return `{${v.join(',')}}`;   // uuid[]
+      if (Array.isArray(v) && k === 'p_territories') return `{${v.join(',')}}`;   // uuid[]
       if (v !== null && typeof v === 'object') return JSON.stringify(v);
       return v;
     });
